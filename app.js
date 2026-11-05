@@ -4,7 +4,7 @@
    ========================================================================= */
 
 const uid = () => 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-const todayStr = () => new Date().toISOString().slice(0, 10);
+const todayStr = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
 
 /* ---------------------------- Account (Firebase Auth) ---------------------------- */
 // The "account" is now a real Firebase account (email/password). Data lives in
@@ -53,7 +53,8 @@ function freshState() {
     owedToYou: [],       // {id, person, amount, date, note, returned}
     upcoming: [],        // {id, name, amount, date, note}
     cashDenominations: [], // {denomination, count} — tracks physical bills/coins on hand
-    transportRoutes: [],   // {id, name, from, to, vehicle, price, icon}
+    transportRoutes: [],   // {id, name, from, to, catId, roundTrip, legs:[{vehicle,price,label}], vehicle, price, icon}
+    transportCategories: null, // [{id, name, icon}] — null until seeded with defaults
   };
 }
 
@@ -422,10 +423,14 @@ function walletBalance(walletId) {
 }
 function totalAcrossWallets() { return state.wallets.reduce((a, w) => a + walletBalance(w.id), 0); }
 
+function monthStart(offset = 0) {
+  // always anchor on day 1 — setMonth() on the 29th-31st overflows into the next month
+  const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - offset); return d;
+}
 function monthTx(offset = 0) {
-  const d = new Date(); d.setMonth(d.getMonth() - offset);
-  const y = d.getFullYear(), m = d.getMonth();
-  return state.transactions.filter(tr => { const dd = new Date(tr.date); return dd.getFullYear() === y && dd.getMonth() === m; });
+  const d = monthStart(offset);
+  const key = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+  return state.transactions.filter(tr => String(tr.date || '').slice(0, 7) === key);
 }
 function monthIncome(offset = 0) { return monthTx(offset).filter(t => t.type === 'income').reduce((a, b) => a + b.amount, 0); }
 function monthExpense(offset = 0) { return monthTx(offset).filter(t => t.type === 'expense').reduce((a, b) => a + b.amount, 0); }
@@ -706,6 +711,11 @@ function authErrorMessage(e) {
     'auth/unauthorized-domain': 'الدومين ده مش مسموح له بالدخول عن طريق Google — لازم يتضاف في Firebase Console ← Authentication ← Settings ← Authorized domains.',
     'auth/operation-not-allowed': 'الدخول بحساب Google مش مفعّل في المشروع — فعّله من Firebase Console ← Authentication ← Sign-in method.',
     'auth/user-disabled': 'الحساب ده متعطّل.',
+    'auth/credential-already-in-use': 'حساب Google ده مربوط بحساب Flosy تاني. استخدم حساب Google مختلف.',
+    'auth/provider-already-linked': 'حساب Google مربوط بالفعل.',
+    'auth/requires-recent-login': 'سجّل خروج وادخل تاني وبعدين جرب الربط.',
+    'auth/cancelled-popup-request': 'اتلغت نافذة الدخول، جرب تاني.',
+    'auth/web-storage-unsupported': 'المتصفح بيمنع التخزين — فعّل الكوكيز أو افتح اللينك في متصفح عادي.',
   };
   return map[code] || 'حصل خطأ، جرب تاني.';
 }
@@ -1104,26 +1114,33 @@ function saveAddMoney() {
 }
 
 /* ============================== ADD EXPENSE ============================== */
-function openAddExpenseSheet(prefillEnv) {
+function openAddExpenseSheet(prefillEnv, prefill) {
+  prefill = prefill || {};
   window.__pendingReceiptFile = null;
+  window.__cashPaid = Object.assign({}, prefill.paid || {});
+  window.__cashChange = {};
+  window.__cashChangeManual = false; window.__cashSkip = false;
+  const cashWal = state.wallets.find(w => w.key === 'cash' || w.id === 'wal_cash');
   openSheet(`
     <div class="sheet-handle"></div>
     <div class="sheet-head"><h3>${t('addExpense')}</h3><button class="icon-btn" onclick="closeSheet()">✕</button></div>
-    <div class="form-group"><label>${t('amount')}</label><input type="number" id="exAmount" placeholder="0"></div>
+    <div class="form-group"><label>${t('amount')}</label><input type="number" inputmode="decimal" id="exAmount" placeholder="0" value="${prefill.amount ? escAttr(prefill.amount) : ''}" oninput="cashSectionRefresh()"></div>
     <div class="form-group"><label>${t('category')}</label>
       <div class="chip-select">${state.envelopes.map((e,i)=>`<div class="chip ${e.id===prefillEnv||(!prefillEnv&&i===0)?'selected':''}" data-env="${e.id}" onclick="selectChip(this)">${e.icon} ${envLabel(e)}</div>`).join('')}</div>
     </div>
     <div class="form-group"><label>${t('description')}</label><input type="text" id="exDesc" placeholder="${t('description')}"></div>
     <div class="form-group"><label>${t('date')}</label><input type="date" id="exDate" value="${todayStr()}"></div>
     <div class="form-group"><label>${t('wallet')}</label>
-      <select id="exWallet">${state.wallets.map(w=>`<option value="${w.id}">${w.icon} ${walLabel(w)}</option>`).join('')}</select>
+      <select id="exWallet" onchange="cashWalletChanged()">${state.wallets.map(w=>`<option value="${w.id}" ${cashWal && prefill.paid && w.id===cashWal.id ? 'selected' : ''}>${w.icon} ${walLabel(w)}</option>`).join('')}</select>
     </div>
+    <div id="cashSection"></div>
     <div class="form-group"><label>${t('receipt')}</label>
       <input type="file" accept="image/*" id="exReceipt" onchange="previewReceipt(this)">
       <img id="exReceiptPreview" class="receipt-preview" style="display:none;">
     </div>
     <button class="btn btn-primary" onclick="saveAddExpense()">${t('save')}</button>
   `);
+  cashWalletChanged();
 }
 function previewReceipt(input) {
   const file = input.files[0]; if (!file) return;
@@ -1140,6 +1157,13 @@ async function saveAddExpense() {
   const date = document.getElementById('exDate').value || todayStr();
   const walletId = document.getElementById('exWallet').value;
   const e = getEnvelope(envelopeId);
+  let cashInfo = null;
+  if (isCashWalletId(walletId)) {
+    if (!cashGate(amount, saveAddExpense)) return; // asks "how did you pay?" when nothing was picked
+    const v = cashValidateAndBuild(amount);
+    if (v.error) { toast(v.error); return; }
+    cashInfo = v;
+  }
   if (e && e.budget > 0) {
     const spentAfter = envelopeSpent(envelopeId) + amount;
     if (spentAfter > e.budget * 1.5) { if (!confirm(state.settings.language==='ar' ? 'المبلغ ده هيخلي القسم يتخطى الميزانية بكتير. تكمل؟' : "This will push the envelope well over budget. Continue?")) return; }
@@ -1163,7 +1187,9 @@ async function saveAddExpense() {
     if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = t('save'); }
   }
   window.__pendingReceiptFile = null;
-  state.transactions.push({ id: transactionId, type: 'expense', amount, envelopeId, description, date, walletId, receiptPath, receiptPendingLocal, createdAt: Date.now() });
+  const cashFields = (cashInfo && cashInfo.paid) ? { cashPaid: cashInfo.paid, cashChange: cashInfo.change } : {};
+  if (cashFields.cashPaid) applyCashMovement(cashFields.cashPaid, cashFields.cashChange, +1);
+  state.transactions.push(Object.assign({ id: transactionId, type: 'expense', amount, envelopeId, description, date, walletId, receiptPath, receiptPendingLocal, createdAt: Date.now() }, cashFields));
   saveState(); closeSheet(); toast(t('savedSuccess')); render();
 }
 
@@ -1588,33 +1614,52 @@ function confirmCanIBuyPurchase(price) {
 /* ============================== HISTORY ============================== */
 window.__histFilter = 'all';
 window.__histSearch = '';
-function renderHistory() {
-  const filters = ['all','today','thisWeek','thisMonthF','incomeF','expenseF','transferF'];
+function normAr(x) {
+  return String(x == null ? '' : x).toLowerCase()
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+    .replace(/[أإآٱ]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه')
+    .replace(/[٠-٩]/g, ch => String(ch.charCodeAt(0) - 1632));
+}
+function escAttr(x) { return String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+function histResultsHtml() {
   let txs = [...state.transactions];
   const now = new Date();
   if (window.__histFilter === 'today') txs = txs.filter(tr => tr.date === todayStr());
   else if (window.__histFilter === 'thisWeek') { const wk = new Date(now); wk.setDate(now.getDate()-7); txs = txs.filter(tr => new Date(tr.date) >= wk); }
-  else if (window.__histFilter === 'thisMonthF') txs = txs.filter(tr => { const d=new Date(tr.date); return d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear(); });
+  else if (window.__histFilter === 'thisMonthF') { const key = todayStr().slice(0, 7); txs = txs.filter(tr => String(tr.date || '').slice(0, 7) === key); }
   else if (window.__histFilter === 'incomeF') txs = txs.filter(tr => tr.type === 'income');
   else if (window.__histFilter === 'expenseF') txs = txs.filter(tr => tr.type === 'expense');
   else if (window.__histFilter === 'transferF') txs = txs.filter(tr => tr.type === 'envelopeTransfer' || tr.type === 'walletTransfer');
-  if (window.__histSearch) {
-    const q = window.__histSearch.toLowerCase();
-    txs = txs.filter(tr => (txTitle(tr)+ ' ' + (tr.note||'') + ' ' + (tr.description||'')).toLowerCase().includes(q));
+  const q = normAr((window.__histSearch || '').trim());
+  if (q) {
+    txs = txs.filter(tr => {
+      const env = tr.envelopeId ? getEnvelope(tr.envelopeId) : null;
+      const hay = normAr([txTitle(tr), tr.note, tr.description, tr.amount, tr.date, env ? envLabel(env) : ''].join(' '));
+      return hay.includes(q);
+    });
   }
   txs.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
-  // group by date
   const groups = {};
   txs.forEach(tr => { (groups[tr.date] = groups[tr.date] || []).push(tr); });
   const dateKeys = Object.keys(groups).sort((a,b)=> new Date(b)-new Date(a));
-
+  return dateKeys.length === 0 ? emptyState('📭', t('noTransactions'), t('noTransactionsSub')) :
+    dateKeys.map(dk => `<div class="day-group-label">${dk}</div><div class="card">${groups[dk].map(tr=>txRowHtmlEditable(tr)).join('')}</div>`).join('');
+}
+// Update ONLY the results list while typing — re-rendering the whole screen
+// destroyed the <input>, which is why the keyboard/focus was lost after every letter.
+function onHistSearch(v) {
+  window.__histSearch = v;
+  const el = document.getElementById('histResults');
+  if (el) el.innerHTML = histResultsHtml();
+}
+function renderHistory() {
+  const filters = ['all','today','thisWeek','thisMonthF','incomeF','expenseF','transferF'];
   return `
     <div class="search-bar">
-      <input type="text" placeholder="${t('searchPlaceholder')}" value="${window.__histSearch}" oninput="window.__histSearch=this.value; render();">
+      <input type="text" id="histSearchInput" autocomplete="off" enterkeyhint="search" placeholder="${t('searchPlaceholder')}" value="${escAttr(window.__histSearch)}" oninput="onHistSearch(this.value)">
     </div>
     <div class="filter-chips">${filters.map(f=>`<div class="chip ${window.__histFilter===f?'selected':''}" onclick="window.__histFilter='${f}'; render();">${t(f)}</div>`).join('')}</div>
-    ${dateKeys.length===0 ? emptyState('📭', t('noTransactions'), t('noTransactionsSub')) :
-      dateKeys.map(dk => `<div class="day-group-label">${dk}</div><div class="card">${groups[dk].map(tr=>txRowHtmlEditable(tr)).join('')}</div>`).join('')}
+    <div id="histResults">${histResultsHtml()}</div>
   `;
 }
 function txRowHtmlEditable(tr) {
@@ -1637,6 +1682,8 @@ function openTxDetail(id) {
       <div class="list-row"><div class="mid t1">${t('amount')}</div><div class="amt neu">${money(tr.amount)}</div></div>
       <div class="list-row"><div class="mid t1">${t('date')}</div><div class="amt neu">${tr.date}</div></div>
       ${tr.note ? `<div class="list-row"><div class="mid t1">${t('note')}</div><div class="amt neu">${tr.note}</div></div>` : ''}
+      ${tr.cashPaid ? `<div class="list-row"><div class="mid t1">💵 ${isArabic()?'دفعت':'Paid with'}</div><div class="amt neu" style="font-size:12px;">${denSummary(tr.cashPaid)}</div></div>` : ''}
+      ${tr.cashChange && Object.keys(tr.cashChange).length ? `<div class="list-row"><div class="mid t1">↩️ ${t('change')}</div><div class="amt neu" style="font-size:12px;">${denSummary(tr.cashChange)}</div></div>` : ''}
       <div id="txReceiptArea">${receiptAreaPlaceholder(tr)}</div>
     </div>
     <button class="btn btn-danger" onclick="deleteTx('${id}')">🗑️ ${t('delete')}</button>
@@ -1695,6 +1742,7 @@ async function removeReceiptFromTx(id) {
 function deleteTx(id) {
   const tr = state.transactions.find(t=>t.id===id);
   if (tr) {
+    if (tr.cashPaid) applyCashMovement(tr.cashPaid, tr.cashChange, -1); // put the bills/coins back
     if (tr.receiptPath && window.SB) window.SB.deleteReceipt(tr.receiptPath);
     if (tr.receiptPendingLocal) deletePendingReceipt(tr.id);
   }
@@ -1751,16 +1799,27 @@ function reportIncome() {
   `;
 }
 function reportExpense() {
-  const byCat = {};
-  monthTx().filter(t=>t.type==='expense').forEach(t => byCat[t.envelopeId] = (byCat[t.envelopeId]||0) + t.amount);
+  const ar = isArabic(), off = window.__expOff || 0;
+  const byCat = expByCat(off);
   const total = Object.values(byCat).reduce((a,b)=>a+b,0);
   const entries = Object.entries(byCat).sort((a,b)=>b[1]-a[1]);
+  const older = ar ? '›' : '‹', newer = ar ? '‹' : '›';
   return `
+    <div class="card" style="display:flex; align-items:center; justify-content:space-between; padding:8px 10px;">
+      <button class="step-btn" onclick="expMonthStep(1)">${older}</button>
+      <div style="text-align:center;"><div style="font-weight:800; font-size:14px;">${monthLabel(off)}</div><div class="small-note">${t('expenses')}: ${fmt(total)} ${state.settings.currency}</div></div>
+      <button class="step-btn" onclick="expMonthStep(-1)" ${off===0?'disabled':''}>${newer}</button>
+    </div>
+    <div class="btn-row" style="margin-bottom:6px;">
+      <button class="btn btn-outline btn-sm" style="flex:1;" id="expPdfBtn" onclick="exportExpensePDF()">📄 PDF</button>
+      <button class="btn btn-outline btn-sm" style="flex:1;" onclick="exportExpenseExcel()">📊 Excel</button>
+    </div>
     <div class="section-head"><h2>${t('expenseCategoriesChart')}</h2></div>
-    ${entries.length===0 ? emptyState('📭', t('noTransactions'),'') : entries.map(([envId,val]) => barRow(envLabel(getEnvelope(envId)||{name:envId}), val, total, 'var(--bad)')).join('')}
+    ${entries.length===0 ? emptyState('📭', t('noTransactions'),'') : entries.map(([envId,val]) => barRow(catName(envId), val, total, 'var(--bad)')).join('')}
     <canvas id="expenseChart" height="200" style="margin-top:10px;"></canvas>
   `;
 }
+function expMonthStep(d) { window.__expOff = Math.max(0, (window.__expOff||0) + d); render(); }
 function barRow(label, val, total, color) {
   const pct = total > 0 ? Math.round((val/total)*100) : 0;
   return `<div class="report-bar-row"><div class="rl">${label}</div><div class="report-bar-track"><div class="report-bar-fill" style="width:${pct}%; background:${color};"></div></div><div class="rv">${fmt(val)}</div></div>`;
@@ -1796,16 +1855,255 @@ function reportSavings() {
     ${state.savingsGoals.map(goalCardHtml).join('')}
   `;
 }
+/* ---------- shared helpers for expense report / month comparison ---------- */
+function monthKey(off) { const d = monthStart(off); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0'); }
+function monthLabel(off) { const d = monthStart(off); return t('months')[d.getMonth()] + ' ' + d.getFullYear(); }
+function expByCat(off) {
+  const o = {};
+  monthTx(off).filter(x => x.type === 'expense').forEach(x => { const k = x.envelopeId || '_none'; o[k] = (o[k]||0) + x.amount; });
+  return o;
+}
+function catName(id) { return id === '_none' ? (isArabic() ? 'بدون قسم' : 'No category') : envLabel(getEnvelope(id) || { name: id }); }
+function cmpOffsets(n) { const a = []; for (let i = n-1; i >= 0; i--) a.push(i); return a; }   // oldest → newest
+function cmpData(n) {
+  const offs = cmpOffsets(n);
+  const per = offs.map(o => expByCat(o));
+  const ids = [...new Set(per.flatMap(p => Object.keys(p)))];
+  const rows = ids.map(id => { const vals = per.map(p => p[id] || 0); return { id, name: catName(id), vals, total: vals.reduce((a,b)=>a+b,0) }; })
+                  .sort((a,b) => b.total - a.total);
+  return {
+    offs, rows,
+    labels: offs.map(monthLabel),
+    exp: offs.map(o => monthExpense(o)),
+    inc: offs.map(o => monthIncome(o)),
+  };
+}
+function pctChange(cur, prev) { return prev > 0 ? Math.round(((cur - prev) / prev) * 100) : null; }
+function changeBadge(cur, prev) {
+  const ar = isArabic(), p = pctChange(cur, prev), diff = cur - prev;
+  if (diff === 0) return `<span style="color:var(--ink-soft);">＝</span>`;
+  const up = diff > 0;
+  return `<span style="color:var(--${up?'bad':'good'}); direction:ltr; unicode-bidi:plaintext;">${up?'▲':'▼'} ${fmt(Math.abs(diff))}${p!==null?` (${Math.abs(p)}%)`:''}</span>`;
+}
+function setCmpN(n) { window.__cmpN = n; render(); }
+
 function reportComparison() {
-  const cur = {}, last = {};
-  monthTx(0).filter(t=>t.type==='expense').forEach(t=> cur[t.envelopeId]=(cur[t.envelopeId]||0)+t.amount);
-  monthTx(1).filter(t=>t.type==='expense').forEach(t=> last[t.envelopeId]=(last[t.envelopeId]||0)+t.amount);
-  const ids = [...new Set([...Object.keys(cur), ...Object.keys(last)])];
-  return `<div class="card">${ids.map(id => {
-    const c = cur[id]||0, l = last[id]||0, diff = c - l;
-    const verdict = diff < 0 ? t('better') : diff === 0 ? t('same') : t('worse');
-    return `<div class="list-row"><div class="mid"><div class="t1">${envLabel(getEnvelope(id)||{name:id})}</div><div class="t2">${t('lastMonth')}: ${fmt(l)} → ${t('thisMonth')}: ${fmt(c)}</div></div><div class="amt neu">${verdict}</div></div>`;
-  }).join('') || emptyState('📭', t('noTransactions'),'')}</div>`;
+  const ar = isArabic(), n = window.__cmpN || 6;
+  const d = cmpData(n);
+  const hasAny = d.exp.some(v => v > 0);
+  const totalsRows = d.offs.slice().reverse().map(o => {
+    const cur = monthExpense(o), prev = monthExpense(o+1);
+    return `<div class="list-row"><div class="mid"><div class="t1">${monthLabel(o)}</div><div class="t2">${t('income')}: ${fmt(monthIncome(o))}</div></div><div style="text-align:left;"><div class="amt neg">${fmt(cur)}</div><div style="font-size:11px; font-weight:700;">${prev>0||cur>0?changeBadge(cur, prev):''}</div></div></div>`;
+  }).join('');
+  const shortHead = d.offs.map(o => { const x = monthStart(o); return `<th style="padding:7px 8px; font-size:11px; white-space:nowrap;">${t('months')[x.getMonth()]}<br><span style="opacity:.6;">${String(x.getFullYear()).slice(2)}</span></th>`; }).join('');
+  const last = d.offs.length - 1;
+  const tableRows = d.rows.map(r => {
+    const cur = r.vals[last], prev = last > 0 ? r.vals[last-1] : 0;
+    return `<tr><td style="padding:7px 8px; font-size:12px; font-weight:700; white-space:nowrap;">${r.name}</td>${r.vals.map(v=>`<td style="padding:7px 8px; text-align:center; font-size:12px; direction:ltr;">${v?fmt(v):'–'}</td>`).join('')}<td style="padding:7px 8px; text-align:center; font-size:12px; font-weight:800; direction:ltr;">${fmt(r.total)}</td><td style="padding:7px 8px; text-align:center; font-size:11px; white-space:nowrap;">${changeBadge(cur, prev)}</td></tr>`;
+  }).join('');
+  const totalRow = `<tr style="background:var(--paper); font-weight:800;"><td style="padding:8px;">${t('total')}</td>${d.exp.map(v=>`<td style="padding:8px; text-align:center; font-size:12px; direction:ltr;">${fmt(v)}</td>`).join('')}<td style="padding:8px; text-align:center; font-size:12px; direction:ltr;">${fmt(d.exp.reduce((a,b)=>a+b,0))}</td><td></td></tr>`;
+  return `
+    <div class="seg" style="margin-bottom:12px;">
+      ${[3,6,12].map(k=>`<button class="${n===k?'active':''}" onclick="setCmpN(${k})">${ar?`آخر ${k} شهور`:`Last ${k} months`}</button>`).join('')}
+    </div>
+    <div class="btn-row" style="margin-bottom:12px;">
+      <button class="btn btn-outline btn-sm" style="flex:1;" id="cmpPdfBtn" onclick="exportComparisonPDF()">📄 PDF</button>
+      <button class="btn btn-outline btn-sm" style="flex:1;" onclick="exportComparisonExcel()">📊 Excel</button>
+    </div>
+    ${!hasAny ? emptyState('📭', t('noTransactions'),'') : `
+    <div class="card"><div class="chart-box"><canvas id="cmpChart"></canvas></div></div>
+    <div class="section-head"><h2>${ar?'إجمالي المصروفات لكل شهر':'Total spending per month'}</h2></div>
+    <div class="card">${totalsRows}</div>
+    <div class="section-head"><h2>${ar?'المصروفات حسب القسم':'Spending by category'}</h2></div>
+    <div class="card" style="padding:0; overflow-x:auto;">
+      <table style="border-collapse:collapse; width:100%; min-width:${180 + n*62}px; color:var(--ink);">
+        <thead><tr style="background:var(--paper);"><th style="padding:7px 8px; text-align:start; font-size:11px;">${ar?'القسم':'Category'}</th>${shortHead}<th style="padding:7px 8px; font-size:11px;">${t('total')}</th><th style="padding:7px 8px; font-size:11px;">${ar?'عن الشهر اللي قبله':'vs prev.'}</th></tr></thead>
+        <tbody>${tableRows}${totalRow}</tbody>
+      </table>
+    </div>`}
+  `;
+}
+function drawComparisonChart() {
+  if (currentScreen !== 'reports' || window.__reportTab !== 'comparison') return;
+  const c = document.getElementById('cmpChart'); if (!c) return;
+  const d = cmpData(window.__cmpN || 6), ar = isArabic();
+  const ink = getComputedStyle(document.body).getPropertyValue('--ink').trim() || '#132420';
+  const grid = getComputedStyle(document.body).getPropertyValue('--line').trim() || '#E4E3DA';
+  mountChart('cmpChart', { type: 'bar',
+    data: { labels: d.labels, datasets: [
+      { label: t('income'), data: d.inc, backgroundColor: '#3F8F5F', borderRadius: 6 },
+      { label: t('expenses'), data: d.exp, backgroundColor: '#C4514A', borderRadius: 6 },
+    ] },
+    options: { responsive: true, maintainAspectRatio: false, animation: { duration: 350 },
+      plugins: { legend: { labels: { color: ink } } },
+      scales: { x: { ticks: { color: ink, maxRotation: 45 }, grid: { display: false } }, y: { ticks: { color: ink }, grid: { color: grid }, beginAtZero: true } } } });
+}
+
+/* ---------- Excel / PDF export (expense report + month comparison) ---------- */
+function ensureXlsx(onReady, onFail) {
+  if (window.XLSX) { onReady(); return; }
+  const urls = ['https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js', 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js'];
+  const tryNext = (i) => {
+    if (i >= urls.length) { onFail && onFail(); return; }
+    const sc = document.createElement('script'); sc.src = urls[i];
+    sc.onload = () => window.XLSX ? onReady() : tryNext(i+1);
+    sc.onerror = () => { sc.remove(); tryNext(i+1); };
+    document.head.appendChild(sc);
+  };
+  tryNext(0);
+}
+function exportToolsError() { toast(isArabic() ? 'تعذّر تحميل أدوات التصدير — تأكد إنك أونلاين وجرب تاني' : "Couldn't load the export tools — check your connection and try again"); }
+function styleSheet(ws, widths, numFmt) {
+  ws['!cols'] = widths.map(w => ({ wch: w }));
+  Object.keys(ws).forEach(k => { if (k[0] !== '!' && ws[k].t === 'n') ws[k].z = numFmt || '#,##0.00'; });
+}
+function saveWorkbook(wb, filename) {
+  if (isArabic()) wb.Workbook = { Views: [{ RTL: true }] };   // open right-to-left in Excel
+  XLSX.writeFile(wb, filename);
+}
+function numCell(v, f) { return f ? { t: 'n', v, f } : { t: 'n', v }; }
+
+function exportExpenseExcel() {
+  ensureXlsx(() => {
+    try {
+      const ar = isArabic(), off = window.__expOff || 0, cur = state.settings.currency;
+      const inc = monthIncome(off), exp = monthExpense(off), sav = monthSaving(off);
+      const byCat = expByCat(off);
+      const entries = Object.entries(byCat).sort((a,b)=>b[1]-a[1]);
+      const wb = XLSX.utils.book_new();
+
+      const sum = XLSX.utils.aoa_to_sheet([
+        [ar ? 'تقرير المصروفات' : 'Expense report', monthLabel(off)],
+        [],
+        [t('income'), inc], [t('expenses'), exp], [t('netChange'), numCell(inc-exp, 'B3-B4')], [t('savingLbl'), sav],
+        [ar ? 'العملة' : 'Currency', cur],
+      ]);
+      styleSheet(sum, [24, 18]); XLSX.utils.book_append_sheet(wb, sum, ar ? 'ملخص' : 'Summary');
+
+      const catRows = [[ar ? 'القسم' : 'Category', ar ? 'المبلغ' : 'Amount', ar ? 'النسبة %' : 'Share %']];
+      entries.forEach(([id, v], i) => catRows.push([catName(id), v, numCell(exp > 0 ? Math.round(v/exp*1000)/10 : 0)]));
+      if (entries.length) catRows.push([t('total'), numCell(exp, `SUM(B2:B${entries.length+1})`), numCell(100)]);
+      const cs = XLSX.utils.aoa_to_sheet(catRows); styleSheet(cs, [26, 16, 12]);
+      XLSX.utils.book_append_sheet(wb, cs, ar ? 'الأقسام' : 'Categories');
+
+      const txs = monthTx(off).filter(x => x.type === 'expense').sort((a,b) => String(a.date).localeCompare(String(b.date)));
+      const txRows = [[t('date'), ar ? 'القسم' : 'Category', ar ? 'المحفظة' : 'Wallet', ar ? 'المبلغ' : 'Amount', ar ? 'الوصف' : 'Description']];
+      txs.forEach(x => txRows.push([x.date, catName(x.envelopeId || '_none'), x.walletId ? walLabel(getWallet(x.walletId) || { name: '' }) : '', x.amount, x.description || x.note || '']));
+      if (txs.length) txRows.push([t('total'), '', '', numCell(exp, `SUM(D2:D${txs.length+1})`), '']);
+      const ts = XLSX.utils.aoa_to_sheet(txRows); styleSheet(ts, [12, 22, 16, 14, 34]);
+      XLSX.utils.book_append_sheet(wb, ts, ar ? 'العمليات' : 'Transactions');
+
+      saveWorkbook(wb, `flosy-expenses-${monthKey(off)}.xlsx`);
+      toast(ar ? 'تم حفظ ملف Excel ✅' : 'Excel file saved ✅');
+    } catch (e) { console.error(e); toast(isArabic() ? 'حصل خطأ أثناء تجهيز ملف Excel' : 'Something went wrong generating the Excel file'); }
+  }, exportToolsError);
+}
+
+function exportComparisonExcel() {
+  ensureXlsx(() => {
+    try {
+      const ar = isArabic(), n = window.__cmpN || 6, d = cmpData(n);
+      const wb = XLSX.utils.book_new();
+      const colL = i => XLSX.utils.encode_col(i);
+      const head = [ar ? 'القسم' : 'Category', ...d.labels, t('total'), ar ? 'المتوسط الشهري' : 'Monthly avg'];
+      const rows = [head];
+      d.rows.forEach((r, i) => {
+        const rn = i + 2;
+        rows.push([r.name, ...r.vals, numCell(r.total, `SUM(B${rn}:${colL(n)}${rn})`), numCell(Math.round(r.total/n*100)/100, `AVERAGE(B${rn}:${colL(n)}${rn})`)]);
+      });
+      const last = d.rows.length + 1;
+      rows.push([t('total'), ...d.exp.map((v, i) => numCell(v, `SUM(${colL(i+1)}2:${colL(i+1)}${last})`)), numCell(d.exp.reduce((a,b)=>a+b,0), `SUM(${colL(n+1)}2:${colL(n+1)}${last})`), '']);
+      const ws = XLSX.utils.aoa_to_sheet(rows); styleSheet(ws, [24, ...d.labels.map(()=>13), 14, 16]);
+      XLSX.utils.book_append_sheet(wb, ws, ar ? 'مقارنة الأقسام' : 'By category');
+
+      const mrows = [[ar ? 'الشهر' : 'Month', t('income'), t('expenses'), t('netChange'), ar ? 'تغيّر المصروفات عن الشهر اللي قبله' : 'Expense change vs prev.', ar ? 'نسبة التغيّر %' : 'Change %']];
+      d.offs.forEach((o, i) => {
+        const rn = i + 2, prev = monthExpense(o+1), cur = d.exp[i], p = pctChange(cur, prev);
+        mrows.push([d.labels[i], d.inc[i], d.exp[i], numCell(d.inc[i]-d.exp[i], `B${rn}-C${rn}`), cur - prev, p === null ? '' : numCell(p)]);
+      });
+      const ms = XLSX.utils.aoa_to_sheet(mrows); styleSheet(ms, [18, 14, 14, 14, 26, 16]);
+      XLSX.utils.book_append_sheet(wb, ms, ar ? 'ملخص شهري' : 'Monthly totals');
+
+      saveWorkbook(wb, `flosy-comparison-${monthKey(n-1)}_to_${monthKey(0)}.xlsx`);
+      toast(ar ? 'تم حفظ ملف Excel ✅' : 'Excel file saved ✅');
+    } catch (e) { console.error(e); toast(isArabic() ? 'حصل خطأ أثناء تجهيز ملف Excel' : 'Something went wrong generating the Excel file'); }
+  }, exportToolsError);
+}
+
+// Same approach as the monthly PDF: render styled HTML off-screen → html2canvas → paginate into jsPDF
+async function htmlToPdf(innerHtml, filename, btnId, width, drawCharts) {
+  const ar = isArabic();
+  if (!window.html2canvas || !(window.jspdf && window.jspdf.jsPDF)) { exportToolsError(); return; }
+  const btn = document.getElementById(btnId), oldLabel = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = ar ? '...جاري التجهيز' : 'Preparing...'; }
+  try {
+    const box = document.createElement('div');
+    box.dir = ar ? 'rtl' : 'ltr';
+    box.style.cssText = `position:fixed; left:-9999px; top:0; width:${width}px; background:#F7F7F3; padding:26px; font-family:Cairo, system-ui, sans-serif; color:#132420;`;
+    box.innerHTML = innerHtml;
+    document.body.appendChild(box);
+    if (drawCharts && window.Chart) drawCharts(box);
+    await new Promise(r => setTimeout(r, 250));
+    const canvas = await html2canvas(box, { scale: 2, backgroundColor: '#F7F7F3' });
+    document.body.removeChild(box);
+    const pdf = new window.jspdf.jsPDF('p', 'pt', 'a4');
+    const pw = pdf.internal.pageSize.getWidth(), ph = pdf.internal.pageSize.getHeight();
+    const ih = canvas.height * pw / canvas.width, img = canvas.toDataURL('image/png');
+    let left = ih, pos = 0;
+    pdf.addImage(img, 'PNG', 0, pos, pw, ih); left -= ph;
+    while (left > 0) { pos -= ph; pdf.addPage(); pdf.addImage(img, 'PNG', 0, pos, pw, ih); left -= ph; }
+    pdf.save(filename);
+    toast(ar ? 'تم حفظ ملف PDF ✅' : 'PDF saved ✅');
+  } catch (e) { console.error(e); toast(ar ? 'حصل خطأ أثناء تجهيز الـ PDF' : 'Something went wrong generating the PDF'); }
+  finally { const b = document.getElementById(btnId); if (b) { b.disabled = false; b.textContent = oldLabel; } }
+}
+function pdfHeader(title, sub) {
+  return `<div style="text-align:center; margin-bottom:18px;"><div style="font-size:30px;">💸</div><div style="font-size:20px; font-weight:900;">Flosy</div><div style="font-size:14px; color:#4A5D57; font-weight:700; margin-top:2px;">${title} — ${sub}</div></div>`;
+}
+function pdfFooter() { return `<div style="text-align:center; margin-top:20px; font-size:10.5px; color:#4A5D57;">Flosy · ${new Date().toLocaleDateString(isArabic()?'ar-EG':'en-US')}</div>`; }
+
+function exportExpensePDF() {
+  const ar = isArabic(), off = window.__expOff || 0;
+  const inc = monthIncome(off), exp = monthExpense(off), sav = monthSaving(off);
+  const entries = Object.entries(expByCat(off)).sort((a,b)=>b[1]-a[1]);
+  const catRows = entries.map(([id, v]) => pdfRow(`${catName(id)} <span style="color:#4A5D57; font-weight:600;">(${exp>0?Math.round(v/exp*100):0}%)</span>`, fmt(v), '#C4514A')).join('');
+  const html = `
+    ${pdfHeader(ar ? 'تقرير المصروفات' : 'Expense report', monthLabel(off))}
+    <div style="border:1px solid #E4E3DA; border-radius:14px; overflow:hidden; margin-bottom:16px;">
+      ${pdfRow(t('income'), fmt(inc), '#3F8F5F')}${pdfRow(t('expenses'), fmt(exp), '#C4514A')}
+      ${pdfRow(t('netChange'), signedMoney(inc-exp), inc-exp>=0?'#3F8F5F':'#C4514A')}${pdfRow(t('savingLbl'), fmt(sav), '#7C6BA8')}
+    </div>
+    ${entries.length ? `<div style="font-size:14px; font-weight:800; margin:14px 0 8px;">${t('expenseCategoriesChart')}</div>
+    <div style="border:1px solid #E4E3DA; border-radius:14px; overflow:hidden; margin-bottom:16px;">${catRows}</div>
+    <canvas id="pdfExpCat" width="500" height="240"></canvas>` : `<div style="text-align:center; padding:24px; color:#4A5D57;">${t('noTransactions')}</div>`}
+    ${pdfFooter()}`;
+  htmlToPdf(html, `flosy-expenses-${monthKey(off)}.pdf`, 'expPdfBtn', 560, box => {
+    const c = box.querySelector('#pdfExpCat'); if (!c) return;
+    new Chart(c, { type: 'doughnut', data: { labels: entries.map(([id]) => catName(id)), datasets: [{ data: entries.map(([,v]) => v), backgroundColor: ['#C4514A','#E8A33D','#2F6F5E','#7C6BA8','#3F8F5F','#4A5D57','#D98A2B','#20362F'] }] }, options: { animation: false, plugins: { legend: { labels: { color: '#132420' } } } } });
+  });
+}
+
+function exportComparisonPDF() {
+  const ar = isArabic(), n = window.__cmpN || 6, d = cmpData(n), last = n - 1;
+  const th = 'padding:7px 6px; font-size:10.5px; background:#fff; border-bottom:1px solid #E4E3DA;';
+  const td = 'padding:7px 6px; font-size:11px; text-align:center; border-bottom:1px solid #E4E3DA; background:#fff; direction:ltr;';
+  const head = d.offs.map((o,i) => { const x = monthStart(o); return `<th style="${th}">${t('months')[x.getMonth()]}<br>${String(x.getFullYear()).slice(2)}</th>`; }).join('');
+  const body = d.rows.map(r => `<tr><td style="${td} text-align:start; font-weight:700; direction:inherit;">${r.name}</td>${r.vals.map(v=>`<td style="${td}">${v?fmt(v):'–'}</td>`).join('')}<td style="${td} font-weight:800;">${fmt(r.total)}</td></tr>`).join('');
+  const totals = `<tr><td style="${td} text-align:start; font-weight:800; direction:inherit;">${t('total')}</td>${d.exp.map(v=>`<td style="${td} font-weight:800;">${fmt(v)}</td>`).join('')}<td style="${td} font-weight:800;">${fmt(d.exp.reduce((a,b)=>a+b,0))}</td></tr>`;
+  const monthRows = d.offs.slice().reverse().map(o => { const cur = monthExpense(o), prev = monthExpense(o+1), diff = cur - prev;
+    return pdfRow(monthLabel(o), `${fmt(cur)}${prev>0||cur>0?` &nbsp;<span style="font-size:11px; color:${diff>0?'#C4514A':'#3F8F5F'};">${diff>0?'▲':diff<0?'▼':'＝'} ${fmt(Math.abs(diff))}</span>`:''}`, '#C4514A'); }).join('');
+  const html = `
+    ${pdfHeader(ar ? 'مقارنة المصروفات بين الشهور' : 'Monthly expense comparison', `${d.labels[0]} → ${d.labels[last]}`)}
+    <canvas id="pdfCmp" width="640" height="260"></canvas>
+    <div style="font-size:14px; font-weight:800; margin:16px 0 8px;">${ar?'إجمالي المصروفات لكل شهر':'Total spending per month'}</div>
+    <div style="border:1px solid #E4E3DA; border-radius:14px; overflow:hidden; margin-bottom:16px;">${monthRows}</div>
+    <div style="font-size:14px; font-weight:800; margin:16px 0 8px;">${ar?'المصروفات حسب القسم':'Spending by category'}</div>
+    <div style="border:1px solid #E4E3DA; border-radius:14px; overflow:hidden;"><table style="border-collapse:collapse; width:100%;"><thead><tr><th style="${th} text-align:start;">${ar?'القسم':'Category'}</th>${head}<th style="${th}">${t('total')}</th></tr></thead><tbody>${body}${totals}</tbody></table></div>
+    ${pdfFooter()}`;
+  htmlToPdf(html, `flosy-comparison-${monthKey(n-1)}_to_${monthKey(0)}.pdf`, 'cmpPdfBtn', 720, box => {
+    const c = box.querySelector('#pdfCmp'); if (!c) return;
+    new Chart(c, { type: 'bar', data: { labels: d.labels, datasets: [{ label: t('income'), data: d.inc, backgroundColor: '#3F8F5F' }, { label: t('expenses'), data: d.exp, backgroundColor: '#C4514A' }] }, options: { animation: false, plugins: { legend: { labels: { color: '#132420' } } } } });
+  });
 }
 
 /* ------------------------------ Monthly report PDF export ------------------------------ */
@@ -1897,14 +2195,16 @@ function pdfRow(label, value, color) {
 }
 
 function runDeferredCharts() {
+  destroyCharts();
   if (currentScreen === 'analytics') { runAnalyticsCharts(); return; }
+  if (window.__reportTab === 'comparison' && document.getElementById('cmpChart')) { ensureChartJs(drawComparisonChart, () => chartEmpty('cmpChart')); return; }
   if (window.__reportTab === 'income' && document.getElementById('incomeChart') && window.Chart) {
     const bySrc = {}; monthTx().filter(t=>t.type==='income').forEach(t => bySrc[t.source] = (bySrc[t.source]||0) + t.amount);
     new Chart(document.getElementById('incomeChart'), { type: 'doughnut', data: { labels: Object.keys(bySrc).map(s=>sourceLabel(s)), datasets: [{ data: Object.values(bySrc), backgroundColor: ['#2F6F5E','#E8A33D','#7C6BA8','#3F8F5F','#C4514A','#4A5D57'] }] }, options: { plugins: { legend: { labels: { color: getComputedStyle(document.body).getPropertyValue('--ink') } } } } });
   }
   if (window.__reportTab === 'expense' && document.getElementById('expenseChart') && window.Chart) {
-    const byCat = {}; monthTx().filter(t=>t.type==='expense').forEach(t => byCat[t.envelopeId] = (byCat[t.envelopeId]||0) + t.amount);
-    new Chart(document.getElementById('expenseChart'), { type: 'doughnut', data: { labels: Object.keys(byCat).map(id=>envLabel(getEnvelope(id)||{name:id})), datasets: [{ data: Object.values(byCat), backgroundColor: ['#C4514A','#E8A33D','#2F6F5E','#7C6BA8','#3F8F5F','#4A5D57','#D98A2B','#20362F'] }] }, options: { plugins: { legend: { labels: { color: getComputedStyle(document.body).getPropertyValue('--ink') } } } } });
+    const byCat = {}; monthTx(window.__expOff||0).filter(t=>t.type==='expense').forEach(t => byCat[t.envelopeId] = (byCat[t.envelopeId]||0) + t.amount);
+    new Chart(document.getElementById('expenseChart'), { type: 'doughnut', data: { labels: Object.keys(byCat).map(id=>catName(id)), datasets: [{ data: Object.values(byCat), backgroundColor: ['#C4514A','#E8A33D','#2F6F5E','#7C6BA8','#3F8F5F','#4A5D57','#D98A2B','#20362F'] }] }, options: { plugins: { legend: { labels: { color: getComputedStyle(document.body).getPropertyValue('--ink') } } } } });
   }
 }
 
@@ -1975,6 +2275,7 @@ function renderSettings() {
     <div class="card">
       <div class="settings-row" style="cursor:pointer;" onclick="switchProfile()"><div class="st">👤 ${state.settings.language==='ar'?'تسجيل الخروج':'Sign out'}</div><div class="amt neu">›</div></div>
       ${window.__userEmail ? `<div class="settings-row"><div class="st">📧 ${window.__userEmail}</div></div>` : ''}
+      ${googleLinkRowHtml()}
       <div class="settings-row" style="cursor:pointer;" onclick="resetApp()"><div class="st" style="color:var(--bad);">${t('resetApp')}</div></div>
     </div>
     <p class="small-note" style="text-align:center; margin-top:6px;">🔒 ${t('offlineNote')}</p>
@@ -2117,11 +2418,11 @@ function renderAnalytics() {
 
     <div class="section-head"><h2>${isAr?'أين يذهب المال أكثر؟':'Where does your money go?'}</h2>
       <button class="link" onclick="exportChartImg('analyticsCatChart','category-breakdown')">⬇️ PNG</button></div>
-    <div class="card"><canvas id="analyticsCatChart" height="220"></canvas></div>
+    <div class="card"><div class="chart-box"><canvas id="analyticsCatChart"></canvas></div></div>
 
     <div class="section-head"><h2>${isAr?'مقارنة هذا الشهر بالشهر الماضي':'This month vs last month'}</h2>
       <button class="link" onclick="exportChartImg('analyticsCompareChart','month-comparison')">⬇️ PNG</button></div>
-    <div class="card"><canvas id="analyticsCompareChart" height="220"></canvas></div>
+    <div class="card"><div class="chart-box"><canvas id="analyticsCompareChart"></canvas></div></div>
 
     <div class="section-head"><h2>${isAr?'أعلى 5 فئات صرفًا':'Top 5 spending categories'}</h2></div>
     <div class="card">
@@ -2136,7 +2437,7 @@ function renderAnalytics() {
 
     <div class="section-head"><h2>${isAr?'اتجاه الصرف خلال آخر 6 شهور':'Spending trend — last 6 months'}</h2>
       <button class="link" onclick="exportChartImg('analyticsTrendChart','spending-trend')">⬇️ PNG</button></div>
-    <div class="card"><canvas id="analyticsTrendChart" height="220"></canvas></div>
+    <div class="card"><div class="chart-box"><canvas id="analyticsTrendChart"></canvas></div></div>
   `;
 }
 function exportChartImg(canvasId, filename) {
@@ -2148,43 +2449,98 @@ function exportChartImg(canvasId, filename) {
 function chartColors() {
   return ['#2F6F5E','#E8A33D','#7C6BA8','#C4514A','#3F8F5F','#D98A2B','#4A5D57','#20362F','#8FBFA8'];
 }
+/* Chart.js loader: if the <script> in index.html failed (slow/blocked CDN) we
+   try other CDNs instead of silently drawing nothing. */
+function ensureChartJs(onReady, onFail) {
+  if (window.Chart) { onReady(); return; }
+  if (window.__chartLoading) { window.__chartLoading.push([onReady, onFail]); return; }
+  window.__chartLoading = [[onReady, onFail]];
+  const urls = [
+    'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js',
+  ];
+  const finish = (ok) => { const q = window.__chartLoading || []; window.__chartLoading = null; q.forEach(([a, b]) => { try { (ok ? a : b) && (ok ? a : b)(); } catch (e) { console.error(e); } }); };
+  const tryNext = (i) => {
+    if (i >= urls.length) { finish(false); return; }
+    const sc = document.createElement('script'); sc.src = urls[i];
+    sc.onload = () => { window.Chart ? finish(true) : tryNext(i + 1); };
+    sc.onerror = () => { sc.remove(); tryNext(i + 1); };
+    document.head.appendChild(sc);
+  };
+  tryNext(0);
+}
+function destroyCharts() {
+  (window.__charts || []).forEach(c => { try { c.destroy(); } catch (e) { /* already gone */ } });
+  window.__charts = [];
+}
+function mountChart(canvasId, config) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return null;
+  try {
+    const c = new Chart(canvas, config);
+    canvas.__chart = c;
+    (window.__charts = window.__charts || []).push(c);
+    return c;
+  } catch (e) {
+    console.error('Chart failed:', canvasId, e);
+    const box = canvas.parentElement;
+    if (box) box.innerHTML = emptyState('⚠️', state.settings.language==='ar' ? 'تعذّر رسم الشكل' : "Couldn't draw this chart", '');
+    return null;
+  }
+}
+function chartEmpty(canvasId) {
+  const c = document.getElementById(canvasId);
+  if (c && c.parentElement) c.parentElement.innerHTML = emptyState('📭', t('noTransactions'), '');
+}
 function runAnalyticsCharts() {
-  if (!window.Chart) return;
+  const ids = ['analyticsCatChart', 'analyticsCompareChart', 'analyticsTrendChart'];
+  if (!ids.some(id => document.getElementById(id))) return;
+  ensureChartJs(drawAnalyticsCharts, () => {
+    const ar = state.settings.language === 'ar';
+    ids.forEach(id => {
+      const c = document.getElementById(id);
+      if (c && c.parentElement) c.parentElement.innerHTML = `<div class="empty-state"><div class="e-ico">📡</div><div class="e-t">${ar ? 'تعذّر تحميل مكتبة الرسوم' : "Couldn't load the chart library"}</div><div class="e-s">${ar ? 'تأكد من النت' : 'Check your connection'}</div><button class="btn btn-outline btn-sm" style="margin-top:10px;" onclick="render()">${ar ? 'إعادة المحاولة' : 'Retry'}</button></div>`;
+    });
+  });
+}
+function drawAnalyticsCharts() {
+  if (currentScreen !== 'analytics') return;
+  destroyCharts();
   const ink = getComputedStyle(document.body).getPropertyValue('--ink').trim() || '#132420';
-  const catCanvas = document.getElementById('analyticsCatChart');
-  if (catCanvas) {
-    const byCat = {};
-    monthTx(0).filter(t=>t.type==='expense').forEach(t => byCat[t.envelopeId] = (byCat[t.envelopeId]||0) + t.amount);
-    const labels = Object.keys(byCat).map(id => getEnvelope(id) ? envLabel(getEnvelope(id)) : id);
-    const data = Object.values(byCat);
-    catCanvas.__chart = new Chart(catCanvas, { type: 'pie', data: { labels, datasets: [{ data, backgroundColor: chartColors() }] },
-      options: { plugins: { legend: { position: 'bottom', labels: { color: ink, boxWidth: 12, font: { size: 11 } } } } } });
+  const grid = getComputedStyle(document.body).getPropertyValue('--line').trim() || '#E4E3DA';
+  const base = { responsive: true, maintainAspectRatio: false, animation: { duration: 350 } };
+  const axes = { x: { ticks: { color: ink }, grid: { color: grid } }, y: { beginAtZero: true, ticks: { color: ink }, grid: { color: grid } } };
+  const nameOf = id => getEnvelope(id) ? envLabel(getEnvelope(id)) : id;
+
+  // 1) where does money go
+  const byCat = {};
+  monthTx(0).filter(x => x.type === 'expense').forEach(x => byCat[x.envelopeId] = (byCat[x.envelopeId] || 0) + x.amount);
+  if (Object.keys(byCat).length === 0) chartEmpty('analyticsCatChart');
+  else mountChart('analyticsCatChart', { type: 'pie', data: { labels: Object.keys(byCat).map(nameOf), datasets: [{ data: Object.values(byCat), backgroundColor: chartColors() }] },
+    options: Object.assign({}, base, { plugins: { legend: { position: 'bottom', labels: { color: ink, boxWidth: 12, font: { size: 11 } } } } }) });
+
+  // 2) this month vs last month
+  const cur = {}, last = {};
+  monthTx(0).filter(x => x.type === 'expense').forEach(x => cur[x.envelopeId] = (cur[x.envelopeId] || 0) + x.amount);
+  monthTx(1).filter(x => x.type === 'expense').forEach(x => last[x.envelopeId] = (last[x.envelopeId] || 0) + x.amount);
+  const ids = [...new Set([...Object.keys(cur), ...Object.keys(last)])];
+  if (ids.length === 0) chartEmpty('analyticsCompareChart');
+  else mountChart('analyticsCompareChart', { type: 'bar', data: { labels: ids.map(nameOf), datasets: [
+      { label: t('lastMonth'), data: ids.map(id => last[id] || 0), backgroundColor: '#A9B7B0' },
+      { label: t('thisMonthF'), data: ids.map(id => cur[id] || 0), backgroundColor: '#2F6F5E' },
+    ] }, options: Object.assign({}, base, { plugins: { legend: { labels: { color: ink } } }, scales: axes }) });
+
+  // 3) 6-month trend
+  const months = [], incArr = [], expArr = [];
+  for (let i = 5; i >= 0; i--) {
+    months.push(t('months')[monthStart(i).getMonth()]);
+    incArr.push(monthIncome(i)); expArr.push(monthExpense(i));
   }
-  const cmpCanvas = document.getElementById('analyticsCompareChart');
-  if (cmpCanvas) {
-    const cur = {}, last = {};
-    monthTx(0).filter(t=>t.type==='expense').forEach(t=> cur[t.envelopeId]=(cur[t.envelopeId]||0)+t.amount);
-    monthTx(1).filter(t=>t.type==='expense').forEach(t=> last[t.envelopeId]=(last[t.envelopeId]||0)+t.amount);
-    const ids = [...new Set([...Object.keys(cur), ...Object.keys(last)])];
-    const labels = ids.map(id => getEnvelope(id) ? envLabel(getEnvelope(id)) : id);
-    cmpCanvas.__chart = new Chart(cmpCanvas, { type: 'bar', data: { labels, datasets: [
-      { label: t('lastMonth'), data: ids.map(id=>last[id]||0), backgroundColor: '#A9B7B0' },
-      { label: t('thisMonthF'), data: ids.map(id=>cur[id]||0), backgroundColor: '#2F6F5E' },
-    ]}, options: { plugins: { legend: { labels: { color: ink } } }, scales: { x: { ticks: { color: ink } }, y: { ticks: { color: ink } } } } });
-  }
-  const trendCanvas = document.getElementById('analyticsTrendChart');
-  if (trendCanvas) {
-    const months = []; const incArr = []; const expArr = [];
-    for (let i = 5; i >= 0; i--) {
-      const d = new Date(); d.setMonth(d.getMonth() - i);
-      months.push(t('months')[d.getMonth()]);
-      incArr.push(monthIncome(i)); expArr.push(monthExpense(i));
-    }
-    trendCanvas.__chart = new Chart(trendCanvas, { type: 'line', data: { labels: months, datasets: [
+  if (![...incArr, ...expArr].some(v => v > 0)) chartEmpty('analyticsTrendChart');
+  else mountChart('analyticsTrendChart', { type: 'line', data: { labels: months, datasets: [
       { label: t('income'), data: incArr, borderColor: '#3F8F5F', backgroundColor: 'rgba(63,143,95,.15)', fill: true, tension: .3 },
       { label: t('expenses'), data: expArr, borderColor: '#C4514A', backgroundColor: 'rgba(196,81,74,.12)', fill: true, tension: .3 },
-    ]}, options: { plugins: { legend: { labels: { color: ink } } }, scales: { x: { ticks: { color: ink } }, y: { ticks: { color: ink } } } } });
-  }
+    ] }, options: Object.assign({}, base, { plugins: { legend: { labels: { color: ink } } }, scales: axes }) });
 }
 
 /* ============================== QUICK SMART ADD ============================== */
@@ -2353,8 +2709,13 @@ function executeQuickAdd(id) {
   const q = (state.quickAddButtons || []).find(x => x.id === id);
   if (!q) return;
   if (!confirm(`${q.icon} ${q.label} — ${fmt(q.amount)} ${state.settings.currency}\n${t('confirmQuickAdd')}`)) return;
-  state.transactions.push({ id: uid(), type: 'expense', amount: q.amount, envelopeId: q.envelopeId, description: q.label, date: todayStr(), walletId: state.wallets[0]?.id, createdAt: Date.now() });
-  saveState(); toast(t('savedSuccess')); render();
+  const walletId = state.wallets[0]?.id;
+  cashResolve(q.amount, walletId, (paid, change) => {
+    const cashFields = paid ? { cashPaid: paid, cashChange: change } : {};
+    if (paid) applyCashMovement(paid, change, +1);
+    state.transactions.push(Object.assign({ id: uid(), type: 'expense', amount: q.amount, envelopeId: q.envelopeId, description: q.label, date: todayStr(), walletId, createdAt: Date.now() }, cashFields));
+    saveState(); closeSheet(); toast(t('savedSuccess')); render();
+  });
 }
 
 /* ============================== MONTHLY REVIEW ============================== */
@@ -2551,4 +2912,631 @@ function fireDueReminders(force) {
 function scheduleReminderCheck() {
   fireDueReminders(false);
   setInterval(() => fireDueReminders(false), 6 * 60 * 60 * 1000); // re-check every 6h while app is open
+}
+
+/* ============================== GOOGLE ACCOUNT LINKING ============================== */
+function googleLinkRowHtml() {
+  if (!window.FB || !window.FB.getProviderIds) return '';
+  const ar = isArabic();
+  const linked = window.FB.getProviderIds().includes('google.com');
+  if (linked) {
+    return `<div class="settings-row"><div><div class="st">🔗 ${ar ? 'حساب Google' : 'Google account'}</div><div class="ss">${ar ? 'مربوط ✅ — تقدر تدخل بيه من أي جهاز' : 'Linked ✅ — you can sign in with it on any device'}</div></div></div>`;
+  }
+  return `<div class="settings-row" style="cursor:pointer;" onclick="linkGoogleAccount()"><div><div class="st">🔗 ${ar ? 'ربط حساب Google' : 'Link Google account'}</div><div class="ss">${ar ? 'اربط حسابك بجوجل عشان تدخل بضغطة واحدة' : 'Link it to sign in with one tap'}</div></div><div class="amt neu">›</div></div>`;
+}
+async function linkGoogleAccount() {
+  if (window.__authBusy) return;
+  window.__authBusy = true;
+  try {
+    await window.FB.linkGoogle();
+    window.__userEmail = (window.FB.auth.currentUser && window.FB.auth.currentUser.email) || window.__userEmail;
+    toast(isArabic() ? 'اتربط حساب Google ✅' : 'Google account linked ✅');
+    render();
+  } catch (e) {
+    toast(authErrorMessage(e));
+  } finally {
+    window.__authBusy = false;
+  }
+}
+
+/* ============================== CASH MANAGER (الفكة) ============================== */
+const DEFAULT_DENOMS = [200, 100, 50, 20, 10, 5, 1, 0.5, 0.25];
+const QU = x => Math.round(x * 4); // work in quarter-pound units so floats never bite
+function isArabic() { return state.settings.language === 'ar'; }
+function denLabel(d) {
+  const ar = isArabic();
+  if (d >= 1) return ar ? `${d} جنيه` : `${d} EGP`;
+  return ar ? `${d * 100} قرش` : `${d * 100} pt`;
+}
+function denSummary(counts) {
+  const parts = Object.keys(counts || {}).map(Number).filter(d => counts[d] > 0).sort((a, b) => b - a)
+    .map(d => `${counts[d]} × ${denLabel(d)}`);
+  return parts.length ? parts.join(' + ') : '—';
+}
+function sumCounts(counts) { return Object.keys(counts || {}).reduce((a, d) => a + Number(d) * (counts[d] || 0), 0); }
+function cashList() { if (!Array.isArray(state.cashDenominations)) state.cashDenominations = []; return state.cashDenominations; }
+function denCount(d) { const r = cashList().find(x => x.denomination === d); return r ? (r.count || 0) : 0; }
+function setDenCount(d, n) {
+  n = Math.max(0, Math.round(n));
+  const r = cashList().find(x => x.denomination === d);
+  if (r) r.count = n; else cashList().push({ denomination: d, count: n });
+}
+function cashTotal() { return cashList().reduce((a, r) => a + r.denomination * (r.count || 0), 0); }
+function cashAdjust(d, delta) { setDenCount(d, denCount(d) + delta); saveState(); render(); }
+function removeDenom(d) { state.cashDenominations = cashList().filter(r => r.denomination !== d); saveState(); render(); }
+function seedDenoms() { DEFAULT_DENOMS.forEach(d => { if (!cashList().some(r => r.denomination === d)) cashList().push({ denomination: d, count: 0 }); }); saveState(); render(); }
+function isCashWalletId(id) { const w = getWallet(id); return !!w && (w.key === 'cash' || w.id === 'wal_cash'); }
+function greedyChange(changeAmt) {
+  let u = QU(changeAmt); const out = {};
+  for (const d of DEFAULT_DENOMS) { const du = QU(d); const n = Math.floor(u / du); if (n > 0) { out[d] = n; u -= n * du; } }
+  return out;
+}
+// dir = +1 when an expense is recorded (paid bills leave, change comes in); -1 to undo it.
+function applyCashMovement(paid, change, dir) {
+  Object.keys(paid || {}).forEach(k => { const d = Number(k); setDenCount(d, denCount(d) - dir * paid[k]); });
+  Object.keys(change || {}).forEach(k => { const d = Number(k); setDenCount(d, denCount(d) + dir * change[k]); });
+}
+
+function renderCashManager() {
+  const ar = isArabic(), cur = state.settings.currency;
+  const rows = cashList().slice().sort((a, b) => b.denomination - a.denomination);
+  return `
+    <div class="hero" style="margin-bottom:14px;">
+      <div class="label">${t('cashOnHand')}</div>
+      <div class="amount">${fmt(cashTotal())} ${cur}</div>
+      <div class="small-note" style="color:#F5FBF8; opacity:.8;">${ar ? 'كل ما تصرف كاش وتسجّل اللي دفعته والباقي، الفئات هنا بتتحدّث لوحدها.' : 'When you log a cash expense with what you paid and the change, these counts update automatically.'}</div>
+    </div>
+    <div class="card">
+      ${rows.length === 0 ? emptyState('💵', t('noDenominations'), '') : rows.map(r => `
+        <div class="list-row">
+          <div class="ico-badge">${r.denomination >= 1 ? '💵' : '🪙'}</div>
+          <div class="mid"><div class="t1">${denLabel(r.denomination)}</div><div class="t2">${t('total')}: ${fmt(r.denomination * (r.count || 0))} ${cur}</div></div>
+          ${(r.count || 0) === 0 ? `<button class="step-btn" style="margin-inline-end:6px;" onclick="removeDenom(${r.denomination})" title="delete">🗑</button>` : ''}
+          <div class="stepper"><button class="step-btn" onclick="cashAdjust(${r.denomination},-1)">−</button><span class="step-val">${r.count || 0}</span><button class="step-btn" onclick="cashAdjust(${r.denomination},1)">+</button></div>
+        </div>`).join('')}
+    </div>
+    <label class="card" style="display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer;">
+      <span><div class="t1" style="font-weight:800; font-size:13.5px;">⚡ ${ar ? 'خصم تلقائي من الفكة' : 'Auto-deduct from cash'}</div>
+      <div class="small-note">${ar ? 'لما تصرف كاش من غير ما تختار الفئات، يخصم بأحسن طريقة دفع ويضبط الباقي لوحده. لو مقفول بيسألك تدفع إزاي.' : 'When you spend cash without picking bills, it pays the best way and sets the change. If off, it asks you how you paid.'}</div></span>
+      <input type="checkbox" ${state.settings.cashAutoDeduct ? 'checked' : ''} onchange="state.settings.cashAutoDeduct=this.checked; saveState(); toast(this.checked ? '${ar ? 'الخصم التلقائي شغال' : 'Auto-deduct on'}' : '${ar ? 'هيسألك كل مرة' : 'Will ask each time'}')">
+    </label>
+    <div class="btn-row">
+      <button class="btn btn-outline" onclick="openAddDenomSheet()">➕ ${t('addDenomination')}</button>
+      ${rows.length === 0 ? `<button class="btn btn-accent" onclick="seedDenoms()">${ar ? 'الفئات الافتراضية' : 'Default set'}</button>` : ''}
+    </div>
+
+    <div class="section-head"><h2>🧠 ${t('smartPay')}</h2></div>
+    <div class="card">
+      <div class="form-group"><label>${ar ? 'المبلغ اللي هتدفعه' : 'Amount to pay'}</label>
+        <input type="number" inputmode="decimal" id="spAmount" placeholder="0" value="${escAttr(window.__spAmt || '')}" oninput="onSmartPayInput(this.value)"></div>
+      <div id="smartPayResults">${smartPayHtml()}</div>
+    </div>
+  `;
+}
+function openAddDenomSheet() {
+  const ar = isArabic();
+  openSheet(`
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><h3>${t('addDenomination')}</h3><button class="icon-btn" onclick="closeSheet()">✕</button></div>
+    <div class="form-group"><label>${t('denomination')} (${state.settings.currency})</label><input type="number" inputmode="decimal" id="denValue" placeholder="${ar ? 'مثلاً 10' : 'e.g. 10'}"></div>
+    <div class="form-group"><label>${t('count')}</label><input type="number" inputmode="numeric" id="denCount" value="0"></div>
+    <button class="btn btn-primary" onclick="saveDenomination()">${t('save')}</button>
+  `);
+}
+function saveDenomination() {
+  const d = parseFloat(document.getElementById('denValue').value);
+  const n = parseInt(document.getElementById('denCount').value, 10) || 0;
+  if (!d || d <= 0) { toast(isArabic() ? 'اكتب فئة صحيحة' : 'Enter a valid denomination'); return; }
+  if (Math.abs(d * 4 - Math.round(d * 4)) > 1e-9) { toast(isArabic() ? 'الفئة لازم تكون من مضاعفات 25 قرش' : 'Denomination must be a multiple of 0.25'); return; }
+  setDenCount(d, denCount(d) + n);
+  saveState(); closeSheet(); render();
+}
+
+/* ---- Smart Pay: pick bills from what you hold so change is minimal ---- */
+function computePayOptions(amount) {
+  const hand = cashList().filter(r => (r.count || 0) > 0 && r.denomination > 0)
+    .map(r => ({ d: r.denomination, u: QU(r.denomination), c: Math.floor(r.count) }))
+    .filter(x => x.u > 0).sort((a, b) => b.u - a.u);
+  const aU = Math.ceil(amount * 4 - 1e-9);
+  if (!hand.length || aU <= 0 || aU > 40000) return { options: [], short: false };
+  const handTotal = hand.reduce((a, x) => a + x.u * x.c, 0);
+  if (handTotal < aU) return { options: [], short: true };
+  const limit = Math.min(aU + hand[0].u, handTotal);
+  const dp = new Array(limit + 1).fill(null);
+  dp[0] = { p: 0, cnt: hand.map(() => 0) };
+  hand.forEach((h, hi) => {
+    const copies = Math.min(h.c, Math.ceil(limit / h.u));
+    for (let k = 0; k < copies; k++) {
+      for (let tot = limit; tot >= h.u; tot--) {
+        const prev = dp[tot - h.u];
+        if (!prev) continue;
+        if (!dp[tot] || prev.p + 1 < dp[tot].p) { const cnt = prev.cnt.slice(); cnt[hi]++; dp[tot] = { p: prev.p + 1, cnt }; }
+      }
+    }
+  });
+  const cands = [];
+  for (let tot = aU; tot <= limit; tot++) {
+    if (!dp[tot]) continue;
+    const counts = {};
+    dp[tot].cnt.forEach((n, i) => { if (n > 0) counts[hand[i].d] = n; });
+    const change = tot / 4 - amount;
+    const changeCounts = change > 0.001 ? greedyChange(change) : {};
+    const changePieces = Object.keys(changeCounts).reduce((a, k) => a + changeCounts[k], 0);
+    cands.push({ counts, total: tot / 4, change, changeCounts, pieces: dp[tot].p, score: dp[tot].p + changePieces });
+  }
+  // fewest bills/coins changing hands (what you give + what comes back), then smallest overpay
+  cands.sort((x, y) => x.score - y.score || x.total - y.total);
+  const options = cands.slice(0, 3);
+  return { options, short: false };
+}
+function onSmartPayInput(v) {
+  window.__spAmt = v;
+  const el = document.getElementById('smartPayResults');
+  if (el) el.innerHTML = smartPayHtml();
+}
+function smartPayHtml() {
+  const ar = isArabic(), cur = state.settings.currency;
+  const amount = parseFloat(window.__spAmt);
+  if (!amount || amount <= 0) return `<div class="small-note">${ar ? 'اكتب المبلغ وهقولك تدفع بإيه من الفئات اللي معاك.' : 'Type an amount and I will suggest what to hand over.'}</div>`;
+  if (cashList().every(r => !r.count)) return `<div class="small-note">${t('noDenominations')}</div>`;
+  const { options, short } = computePayOptions(amount);
+  window.__spOptions = options;
+  if (short) return `<div class="alert-card danger"><div class="t">${ar ? 'الكاش اللي معاك أقل من المبلغ ده.' : "You don't have enough cash for this amount."}</div></div>`;
+  if (!options.length) return `<div class="small-note">${ar ? 'مفيش طريقة دفع متاحة بالفئات الحالية.' : 'No payment combination with current denominations.'}</div>`;
+  return `<div class="small-note" style="margin-bottom:8px;">${t('payWithOptions')}</div>` + options.map((o, i) => `
+    <div class="card" style="margin-bottom:8px; ${i === 0 ? 'border-color:var(--primary-2);' : ''}">
+      ${i === 0 ? `<span class="badge paid">${t('bestCombo')}</span>` : ''}
+      <div class="t1" style="font-size:13.5px; font-weight:800; margin:6px 0 2px;">${denSummary(o.counts)}</div>
+      <div class="small-note">${ar ? 'إجمالي' : 'Total'}: ${fmt(o.total)} ${cur} · ${t('change')}: <b>${o.change > 0.001 ? fmt(o.change) + ' ' + cur : (ar ? 'مفيش' : 'none')}</b>${o.change > 0.001 ? ` (${denSummary(o.changeCounts)})` : ''}</div>
+      <button class="btn btn-outline btn-sm" style="margin-top:8px;" onclick="useSmartPay(${i})">${ar ? 'سجّل الصرف بالطريقة دي' : 'Log expense this way'}</button>
+    </div>`).join('');
+}
+function useSmartPay(i) {
+  const o = (window.__spOptions || [])[i]; if (!o) return;
+  openAddExpenseSheet(null, { amount: parseFloat(window.__spAmt), paid: o.counts });
+}
+
+/* ---- Cash section inside the "add expense" sheet ---- */
+function cashWalletChanged() {
+  const sel = document.getElementById('exWallet'), sec = document.getElementById('cashSection');
+  if (!sel || !sec) return;
+  if (!isCashWalletId(sel.value)) { window.__cashPaid = {}; window.__cashChange = {}; sec.innerHTML = ''; return; }
+  cashSectionRefresh();
+}
+function cashSectionRefresh() {
+  const sel = document.getElementById('exWallet'), sec = document.getElementById('cashSection');
+  if (!sel || !sec || !isCashWalletId(sel.value)) return;
+  // drop paid counts we no longer hold
+  Object.keys(window.__cashPaid || {}).forEach(k => { const mx = denCount(Number(k)); if (window.__cashPaid[k] > mx) window.__cashPaid[k] = mx; if (window.__cashPaid[k] <= 0) delete window.__cashPaid[k]; });
+  const amount = parseFloat((document.getElementById('exAmount') || {}).value) || 0;
+  const paidTotal = sumCounts(window.__cashPaid);
+  if (!window.__cashChangeManual) window.__cashChange = paidTotal - amount > 0.13 ? greedyChange(paidTotal - amount) : {};
+  sec.innerHTML = cashSectionHtml(amount, paidTotal);
+}
+function cashSectionHtml(amount, paidTotal) {
+  const ar = isArabic(), cur = state.settings.currency;
+  const held = cashList().filter(r => (r.count || 0) > 0).sort((a, b) => b.denomination - a.denomination);
+  if (!held.length) {
+    return `<div class="cash-box"><div class="small-note">💵 ${ar ? 'سجّل الفئات اللي معاك من "إدارة الفكة" (في قائمة المزيد) عشان تتابع اللي بتدفعه والباقي.' : 'Add your bills in "Cash Manager" (More menu) to track what you pay and the change.'}</div></div>`;
+  }
+  const expected = paidTotal - amount;
+  const stepper = (d, count, fnAdj, max) => `
+    <div class="den-row"><div class="den-name">${denLabel(d)}</div>
+      <div class="stepper"><button type="button" class="step-btn" onclick="${fnAdj}(${d},-1)">−</button><span class="step-val">${count}</span><button type="button" class="step-btn" onclick="${fnAdj}(${d},1)" ${count >= max ? 'disabled' : ''}>+</button></div></div>`;
+  let html = `<div class="cash-box">
+    <div class="cash-title">💵 ${ar ? 'دفعت بإيه؟' : 'What did you pay with?'} <span class="small-note">(${ar ? 'اختياري' : 'optional'})</span></div>
+    ${amount > 0 ? `<button type="button" class="btn btn-outline btn-sm" style="margin-bottom:8px;" onclick="cashSuggestPay()">🧠 ${ar ? 'اقترح عليّ أدفع بإيه' : 'Suggest what to pay with'}</button>` : ''}
+    ${held.map(r => stepper(r.denomination, (window.__cashPaid || {})[r.denomination] || 0, 'cashPaidAdj', r.count)).join('')}`;
+  if (paidTotal > 0) {
+    html += `<div class="cash-sum">${ar ? 'اللي دفعته' : 'Paid'}: <b>${fmt(paidTotal)} ${cur}</b>`;
+    if (amount > 0) html += ` · ${ar ? 'المبلغ' : 'Amount'}: <b>${fmt(amount)}</b>`;
+    html += `</div>`;
+    if (amount > 0 && expected < -0.13) {
+      html += `<div class="split-total bad">${ar ? 'اللي دفعته أقل من المبلغ' : 'What you paid is less than the amount'}</div>`;
+    } else if (amount > 0 && expected > 0.13) {
+      const got = sumCounts(window.__cashChange), ok = Math.abs(got - expected) <= 0.13;
+      const shown = DEFAULT_DENOMS.filter(d => d <= expected + 0.001 || (window.__cashChange || {})[d]);
+      html += `<div class="cash-title" style="margin-top:12px;">↩️ ${ar ? 'الباقي اللي رجعلك' : 'Change you received'}: ${fmt(expected)} ${cur}</div>
+        ${shown.map(d => stepper(d, (window.__cashChange || {})[d] || 0, 'cashChangeAdj', 999)).join('')}
+        <div class="split-total ${ok ? 'ok' : 'bad'}">${ok ? (ar ? 'الباقي مظبوط ✔' : 'Change matches ✔') : (ar ? `مجموع الباقي ${fmt(got)} — المفروض ${fmt(expected)}` : `Change total ${fmt(got)} — expected ${fmt(expected)}`)}</div>
+        <button type="button" class="btn btn-outline btn-sm" style="margin-top:8px;" onclick="cashChangeAuto()">${ar ? 'اقتراح تلقائي' : 'Auto-suggest'}</button>`;
+    } else if (amount > 0) {
+      html += `<div class="split-total ok">${ar ? 'دفعت بالظبط — مفيش باقي ✔' : 'Exact payment — no change ✔'}</div>`;
+    }
+  }
+  return html + `</div>`;
+}
+function cashPaidAdj(d, delta) {
+  const cur = (window.__cashPaid || {})[d] || 0;
+  const n = Math.min(Math.max(0, cur + delta), denCount(d));
+  if (n > 0) window.__cashPaid[d] = n; else delete window.__cashPaid[d];
+  window.__cashChangeManual = false;
+  cashSectionRefresh();
+}
+function cashChangeAdj(d, delta) {
+  const cur = (window.__cashChange || {})[d] || 0;
+  const n = Math.max(0, cur + delta);
+  if (n > 0) window.__cashChange[d] = n; else delete window.__cashChange[d];
+  window.__cashChangeManual = true;
+  cashSectionRefresh();
+}
+function cashSuggestPay() {
+  const amount = parseFloat((document.getElementById('exAmount') || {}).value) || 0;
+  const { options, short } = computePayOptions(amount);
+  if (short) { toast(isArabic() ? 'الكاش اللي معاك أقل من المبلغ' : "You don't have enough cash"); return; }
+  if (!options.length) return;
+  window.__cashPaid = Object.assign({}, options[0].counts);
+  window.__cashChangeManual = false;
+  cashSectionRefresh();
+}
+function cashChangeAuto() { window.__cashChangeManual = false; cashSectionRefresh(); }
+function cashValidateAndBuild(amount) {
+  const ar = isArabic();
+  const paid = Object.assign({}, window.__cashPaid || {});
+  const paidTotal = sumCounts(paid);
+  if (paidTotal <= 0) return { paid: null, change: null }; // not tracking this one
+  if (paidTotal + 0.13 < amount) return { error: ar ? 'الفئات اللي اخترتها أقل من المبلغ' : 'The bills you picked are less than the amount' };
+  const expected = paidTotal - amount;
+  const change = expected > 0.13 ? Object.assign({}, window.__cashChange || {}) : {};
+  if (Math.abs(sumCounts(change) - (expected > 0.13 ? expected : 0)) > 0.13) return { error: ar ? 'مجموع الباقي مش مطابق للمفروض يرجعلك' : "The change total doesn't match what you should get back" };
+  return { paid, change };
+}
+
+/* ---- "How did you pay?" — deduct from the cash manager automatically or ask ---- */
+function cashAutoMsg(o) {
+  const ar = isArabic();
+  return `${ar ? 'اتخصم من الفكة' : 'Deducted'}: ${denSummary(o.counts)}` + (o.change > 0.001 ? ` · ${ar ? 'الباقي' : 'change'}: ${denSummary(o.changeCounts)}` : '');
+}
+function cashApplyOption(o) {
+  window.__cashPaid = Object.assign({}, o.counts);
+  window.__cashChange = Object.assign({}, o.changeCounts);
+  window.__cashChangeManual = true;
+}
+function cashOptionsHtml(options, pickFn, editFn, skipFn) {
+  const ar = isArabic(), cur = state.settings.currency;
+  return options.map((o, i) => `
+    <div class="card" style="margin-bottom:8px; ${i === 0 ? 'border-color:var(--primary-2);' : ''}">
+      ${i === 0 ? `<span class="badge paid">${t('bestCombo')}</span>` : ''}
+      <div class="t1" style="font-size:13.5px; font-weight:800; margin:6px 0 2px;">${denSummary(o.counts)}</div>
+      <div class="small-note">${t('change')}: <b>${o.change > 0.001 ? fmt(o.change) + ' ' + cur : (ar ? 'مفيش' : 'none')}</b>${o.change > 0.001 ? ` (${denSummary(o.changeCounts)})` : ''}</div>
+      <div class="btn-row" style="margin-top:8px;">
+        <button type="button" class="btn btn-accent btn-sm" style="flex:1;" onclick="${pickFn}(${i})">✔ ${ar ? 'دفعت كده' : 'I paid this way'}</button>
+        ${editFn ? `<button type="button" class="btn btn-outline btn-sm" onclick="${editFn}(${i})">✏️ ${ar ? 'عدّل' : 'Edit'}</button>` : ''}
+      </div>
+    </div>`).join('') + `<button type="button" class="btn btn-outline btn-sm" style="width:100%;" onclick="${skipFn}()">${ar ? 'من غير ما أتابع الفكة المرة دي' : "Don't track cash this time"}</button>`;
+}
+// For forms already on screen (expense / trip). Returns true when the caller may go on saving.
+function cashGate(amount, saveFn) {
+  if (cashTotal() <= 0) return true;                               // cash manager not in use
+  if (sumCounts(window.__cashPaid) > 0 || window.__cashSkip) return true; // user already chose
+  const { options, short } = computePayOptions(amount);
+  if (short) { toast(isArabic() ? 'الفكة المسجلة أقل من المبلغ — اتسجل من غير خصم' : 'Tracked cash is less than this amount — saved without deducting'); window.__cashSkip = true; return true; }
+  if (!options.length) return true;
+  if (state.settings.cashAutoDeduct) { cashApplyOption(options[0]); toast(cashAutoMsg(options[0])); return true; }
+  const sec = document.getElementById('cashSection');
+  if (!sec) return true;
+  window.__cashAskFn = saveFn; window.__cashAskOpts = options;
+  sec.innerHTML = `<div class="cash-box" style="border-color:var(--primary-2);">
+    <div class="cash-title">💵 ${isArabic() ? `دفعت ${fmt(amount)} إزاي؟` : `How did you pay ${fmt(amount)}?`}</div>
+    ${cashOptionsHtml(options, 'cashAskPick', 'cashAskEdit', 'cashAskSkip')}</div>`;
+  sec.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  return false;
+}
+function cashAskPick(i) { const o = (window.__cashAskOpts || [])[i]; if (!o) return; cashApplyOption(o); const fn = window.__cashAskFn; if (fn) fn(); }
+function cashAskEdit(i) { const o = (window.__cashAskOpts || [])[i]; if (!o) return; cashApplyOption(o); cashSectionRefresh(); }
+function cashAskSkip() { window.__cashSkip = true; const fn = window.__cashAskFn; if (fn) fn(); }
+
+// For one-tap flows with no form (quick-add buttons): auto, or a small sheet to ask.
+function cashResolve(amount, walletId, finish) {
+  if (!isCashWalletId(walletId) || cashTotal() <= 0) { finish(null, null); return; }
+  const { options, short } = computePayOptions(amount);
+  if (short || !options.length) { toast(isArabic() ? 'الفكة المسجلة أقل من المبلغ — اتسجل من غير خصم' : 'Tracked cash is less than this amount — saved without deducting'); finish(null, null); return; }
+  if (state.settings.cashAutoDeduct) { toast(cashAutoMsg(options[0])); finish(options[0].counts, options[0].changeCounts); return; }
+  window.__cashResolveOpts = options; window.__cashResolveFinish = finish;
+  openSheet(`
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><h3>💵 ${isArabic() ? `دفعت ${fmt(amount)} إزاي؟` : `How did you pay ${fmt(amount)}?`}</h3><button class="icon-btn" onclick="closeSheet()">✕</button></div>
+    ${cashOptionsHtml(options, 'cashResolvePick', null, 'cashResolveSkip')}
+  `);
+}
+function cashResolvePick(i) { const o = window.__cashResolveOpts[i]; const f = window.__cashResolveFinish; if (o && f) f(o.counts, o.changeCounts); }
+function cashResolveSkip() { const f = window.__cashResolveFinish; if (f) f(null, null); }
+
+/* ============================== TRANSPORT (طرق المواصلات) ============================== */
+const VEHICLES = [{ k: 'microbus', ic: '🚐' }, { k: 'bus', ic: '🚌' }, { k: 'train', ic: '🚆' }, { k: 'taxi', ic: '🚕' }, { k: 'uber', ic: '📱' }, { k: 'car', ic: '🚗' }];
+const CAT_EMOJIS = ['🎓', '💼', '🏠', '📚', '🏋️', '🛒', '🏥', '👨‍👩‍👧', '⚽', '🧭'];
+function vehIcon(k) { const v = VEHICLES.find(x => x.k === k); return v ? v.ic : '🚌'; }
+function tripsOf() { return state.transactions.filter(x => x.type === 'expense' && x.routeId); }
+function transportEnvId() {
+  if (getEnvelope('env_transport')) return 'env_transport';
+  const e = state.envelopes.find(x => x.key === 'transport') || state.envelopes[0];
+  return e ? e.id : null;
+}
+
+/* ---- categories (الأقسام): add / edit / delete ---- */
+function transportCats() {
+  if (!Array.isArray(state.transportCategories)) {
+    const ar = isArabic();
+    state.transportCategories = [
+      { id: 'tc_college', name: ar ? 'الكلية' : 'College', icon: '🎓' },
+      { id: 'tc_work', name: ar ? 'الشغل' : 'Work', icon: '💼' },
+      { id: 'tc_other', name: ar ? 'مشاوير تانية' : 'Other', icon: '🧭' },
+    ];
+  }
+  return state.transportCategories;
+}
+function catOf(id) { return transportCats().find(c => c.id === id) || null; }
+function openCatsSheet() {
+  const ar = isArabic();
+  const cats = transportCats();
+  openSheet(`
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><h3>🗂 ${ar ? 'أقسام المواصلات' : 'Transport categories'}</h3><button class="icon-btn" onclick="closeSheet()">✕</button></div>
+    <div class="card">
+      ${cats.length === 0 ? `<div class="small-note">${ar ? 'مفيش أقسام' : 'No categories'}</div>` : cats.map(c => {
+        const n = state.transportRoutes.filter(r => r.catId === c.id).length;
+        return `<div class="list-row"><div class="ico-badge">${c.icon}</div><div class="mid"><div class="t1">${escAttr(c.name)}</div><div class="t2">${n} ${ar ? 'طريق' : 'routes'}</div></div>
+          <button class="step-btn" onclick="openCatEditSheet('${c.id}')">✏️</button>
+          <button class="step-btn" style="margin-inline-start:6px;" onclick="deleteCat('${c.id}')">🗑</button></div>`;
+      }).join('')}
+    </div>
+    <button class="btn btn-primary" onclick="openCatEditSheet()">➕ ${ar ? 'إضافة قسم' : 'Add category'}</button>
+  `);
+}
+function openCatEditSheet(id) {
+  const ar = isArabic();
+  const c = id ? catOf(id) : null;
+  openSheet(`
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><h3>${c ? (ar ? 'تعديل القسم' : 'Edit category') : (ar ? 'قسم جديد' : 'New category')}</h3><button class="icon-btn" onclick="openCatsSheet()">✕</button></div>
+    <div class="form-group"><label>${ar ? 'اسم القسم' : 'Name'}</label><input type="text" id="catName" value="${escAttr(c ? c.name : '')}" placeholder="${ar ? 'مثلاً: الجيم' : 'e.g. Gym'}"></div>
+    <div class="form-group"><label>${ar ? 'الأيقونة' : 'Icon'}</label>
+      <input type="text" id="catIcon" maxlength="4" value="${escAttr(c ? c.icon : '🧭')}" style="font-size:22px; text-align:center;">
+      <div class="filter-chips" style="margin-top:8px; flex-wrap:wrap;">${CAT_EMOJIS.map(e => `<div class="chip" onclick="document.getElementById('catIcon').value='${e}'">${e}</div>`).join('')}</div>
+    </div>
+    <button class="btn btn-primary" onclick="saveCat('${id || ''}')">${t('save')}</button>
+  `);
+}
+function saveCat(id) {
+  const name = document.getElementById('catName').value.trim();
+  const icon = document.getElementById('catIcon').value.trim() || '🧭';
+  if (!name) { toast(isArabic() ? 'اكتب اسم القسم' : 'Enter a name'); return; }
+  if (id) { const c = catOf(id); if (c) { c.name = name; c.icon = icon; } }
+  else transportCats().push({ id: uid(), name, icon });
+  saveState(); render(); openCatsSheet();
+}
+function deleteCat(id) {
+  const ar = isArabic();
+  const c = catOf(id); if (!c) return;
+  const n = state.transportRoutes.filter(r => r.catId === id).length;
+  const msg = n ? (ar ? `القسم "${c.name}" فيه ${n} طريق. هيتنقلوا لـ "بدون قسم". تمسحه؟` : `"${c.name}" has ${n} routes. They'll move to "No category". Delete?`)
+                : (ar ? `تمسح قسم "${c.name}"؟` : `Delete "${c.name}"?`);
+  if (!confirm(msg)) return;
+  state.transportRoutes.forEach(r => { if (r.catId === id) r.catId = null; });
+  state.transportCategories = transportCats().filter(x => x.id !== id);
+  if (window.__trCat === id) window.__trCat = 'all';
+  saveState(); render(); openCatsSheet();
+}
+
+/* ---- routes: a fixed route is one or more legs (e.g. microbus 5 + tuk-tuk 3) ---- */
+function routeLegs(r) {
+  if (Array.isArray(r.legs) && r.legs.length) return r.legs;
+  return [{ vehicle: r.vehicle || 'bus', price: Number(r.price) || 0, label: '' }];
+}
+function routeOneWay(r) { return routeLegs(r).reduce((a, l) => a + (Number(l.price) || 0), 0); }
+function routeLegsLine(r) { return routeLegs(r).map(l => `${vehIcon(l.vehicle)} ${fmt(l.price)}`).join(' + '); }
+
+function routeCardHtml(r) {
+  const ar = isArabic(), cur = state.settings.currency;
+  const legs = routeLegs(r);
+  return `
+    <div class="card">
+      <div class="list-row" style="border:none; padding:0 0 8px;">
+        <div class="ico-badge">${legs.length > 1 ? '🔀' : vehIcon(legs[0].vehicle)}</div>
+        <div class="mid"><div class="t1">${escAttr(r.name)}</div>
+          <div class="t2">${escAttr(r.from || '')}${r.from && r.to ? ' ← ' : ''}${escAttr(r.to || '')}</div></div>
+        <div class="amt neu">${fmt(routeOneWay(r))} ${cur}</div>
+      </div>
+      <div class="small-note" style="margin-bottom:10px;">${routeLegsLine(r)}${r.roundTrip ? ` · <span class="badge paid">${ar ? 'ذهاب وعودة' : 'round trip'}</span>` : ''}</div>
+      <div class="btn-row">
+        <button class="btn btn-accent btn-sm" style="flex:1;" onclick="openTripSheet('${r.id}')">🚍 ${t('logTrip')}</button>
+        <button class="btn btn-outline btn-sm" onclick="openRouteSheet('${r.id}')">✏️</button>
+      </div>
+    </div>`;
+}
+function renderTransportRoutes() {
+  const ar = isArabic();
+  if (!Array.isArray(state.transportRoutes)) state.transportRoutes = [];
+  const cats = transportCats();
+  const flt = window.__trCat || 'all';
+  const hasOrphans = state.transportRoutes.some(r => !catOf(r.catId));
+  const groups = [...cats.map(c => ({ id: c.id, label: `${c.icon} ${escAttr(c.name)}`, routes: state.transportRoutes.filter(r => r.catId === c.id) })),
+                  { id: 'none', label: `📂 ${ar ? 'بدون قسم' : 'No category'}`, routes: state.transportRoutes.filter(r => !catOf(r.catId)) }]
+    .filter(g => g.routes.length && (flt === 'all' || flt === g.id));
+  return `
+    <p class="small-note" style="margin:0 0 12px;">${t('routesSub')}</p>
+    <div class="btn-row" style="margin-bottom:12px;">
+      <button class="btn btn-primary" onclick="openRouteSheet()">➕ ${t('addRoute')}</button>
+      <button class="btn btn-outline" onclick="openCatsSheet()">🗂 ${ar ? 'الأقسام' : 'Categories'}</button>
+    </div>
+    ${cats.length ? `<div class="filter-chips"><div class="chip ${flt === 'all' ? 'selected' : ''}" onclick="window.__trCat='all'; render();">${t('all') || (ar ? 'الكل' : 'All')}</div>
+      ${cats.map(c => `<div class="chip ${flt === c.id ? 'selected' : ''}" onclick="window.__trCat='${c.id}'; render();">${c.icon} ${escAttr(c.name)}</div>`).join('')}
+      ${hasOrphans ? `<div class="chip ${flt === 'none' ? 'selected' : ''}" onclick="window.__trCat='none'; render();">📂 ${ar ? 'بدون قسم' : 'None'}</div>` : ''}</div>` : ''}
+    ${groups.length === 0 ? emptyState('🚍', t('noRoutes'), '') : groups.map(g => `
+      <div class="section-head"><h2>${g.label}</h2><span class="small-note">${g.routes.length}</span></div>
+      ${g.routes.map(routeCardHtml).join('')}`).join('')}
+  `;
+}
+
+/* route editor sheet */
+function rtLegsHtml() {
+  const ar = isArabic();
+  const legs = window.__rtLegs || [];
+  return legs.map((l, i) => `
+    <div class="den-row" style="gap:6px;">
+      <select style="flex:1.3;" onchange="rtLegSet(${i},'vehicle',this.value)">${VEHICLES.map(v => `<option value="${v.k}" ${l.vehicle === v.k ? 'selected' : ''}>${v.ic} ${t(v.k)}</option>`).join('')}</select>
+      <input type="number" inputmode="decimal" style="flex:1; min-width:0;" placeholder="${ar ? 'السعر' : 'Price'}" value="${escAttr(l.price === '' || l.price == null ? '' : l.price)}" oninput="rtLegSet(${i},'price',this.value)">
+      ${legs.length > 1 ? `<button type="button" class="step-btn" onclick="rtLegDel(${i})">✕</button>` : ''}
+    </div>`).join('') + `<div class="split-total ok" id="rtLegsTotal">${rtTotalText()}</div>`;
+}
+function rtTotalText() {
+  const ar = isArabic();
+  const one = (window.__rtLegs || []).reduce((a, l) => a + (parseFloat(l.price) || 0), 0);
+  const round = (document.getElementById('rtRound') || {}).checked;
+  return `${ar ? 'إجمالي الاتجاه الواحد' : 'One way'}: ${fmt(one)} ${state.settings.currency}${round ? ` · ${ar ? 'ذهاب وعودة' : 'round trip'}: ${fmt(one * 2)}` : ''}`;
+}
+function rtLegSet(i, k, v) {
+  if (!window.__rtLegs[i]) return;
+  window.__rtLegs[i][k] = v;
+  const el = document.getElementById('rtLegsTotal'); if (el) el.textContent = rtTotalText();
+}
+function rtLegAdd() { window.__rtLegs.push({ vehicle: 'microbus', price: '' }); document.getElementById('rtLegs').innerHTML = rtLegsHtml(); }
+function rtLegDel(i) { window.__rtLegs.splice(i, 1); document.getElementById('rtLegs').innerHTML = rtLegsHtml(); }
+function openRouteSheet(id) {
+  const ar = isArabic();
+  const r = id ? state.transportRoutes.find(x => x.id === id) : null;
+  window.__rtLegs = r ? routeLegs(r).map(l => ({ vehicle: l.vehicle, price: l.price })) : [{ vehicle: 'microbus', price: '' }];
+  const cats = transportCats();
+  const selCat = r ? r.catId : (window.__trCat && catOf(window.__trCat) ? window.__trCat : (cats[0] ? cats[0].id : ''));
+  openSheet(`
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><h3>${r ? t('editRoute') : t('addRoute')}</h3><button class="icon-btn" onclick="closeSheet()">✕</button></div>
+    <div class="form-group"><label>${t('routeName')}</label><input type="text" id="rtName" value="${escAttr(r ? r.name : '')}" placeholder="${ar ? 'مثلاً: البيت ← الكلية' : 'e.g. Home → College'}"></div>
+    <div class="form-group"><label>${ar ? 'القسم' : 'Category'}</label>
+      <select id="rtCat"><option value="">📂 ${ar ? 'بدون قسم' : 'No category'}</option>${cats.map(c => `<option value="${c.id}" ${c.id === selCat ? 'selected' : ''}>${c.icon} ${escAttr(c.name)}</option>`).join('')}</select></div>
+    <div class="form-group"><label>${t('fromLocation')}</label><input type="text" id="rtFrom" value="${escAttr(r ? r.from : '')}"></div>
+    <div class="form-group"><label>${t('toLocation')}</label><input type="text" id="rtTo" value="${escAttr(r ? r.to : '')}"></div>
+    <div class="form-group"><label>${ar ? 'الركوبات (لو الطريق فيه أكتر من مواصلة زوّدها)' : 'Rides on this route (add more if you change vehicles)'}</label>
+      <div id="rtLegs">${rtLegsHtml()}</div>
+      <button type="button" class="btn btn-outline btn-sm" style="margin-top:8px;" onclick="rtLegAdd()">➕ ${ar ? 'إضافة مواصلة' : 'Add a ride'}</button>
+    </div>
+    <label class="den-row" style="cursor:pointer;"><span class="den-name">${ar ? 'غالباً بروح وأرجع (ذهاب وعودة)' : 'Usually round trip'}</span><input type="checkbox" id="rtRound" ${r && r.roundTrip ? 'checked' : ''} onchange="document.getElementById('rtLegsTotal').textContent = rtTotalText()"></label>
+    <button class="btn btn-primary" style="margin-top:14px;" onclick="saveRoute('${id || ''}')">${t('save')}</button>
+    ${r ? `<button class="btn btn-danger" style="margin-top:10px;" onclick="deleteRoute('${id}')">🗑️ ${t('delete')}</button>` : ''}
+  `);
+}
+function saveRoute(id) {
+  const ar = isArabic();
+  const name = document.getElementById('rtName').value.trim();
+  const legs = (window.__rtLegs || []).map(l => ({ vehicle: l.vehicle, price: parseFloat(l.price) })).filter(l => l.price >= 0);
+  const one = legs.reduce((a, l) => a + l.price, 0);
+  if (!name || !legs.length || !(one > 0)) { toast(ar ? 'اكتب اسم الطريق وسعر المواصلة' : 'Enter a route name and a price'); return; }
+  const data = {
+    name, legs, price: one, vehicle: legs[0].vehicle, icon: legs.length > 1 ? '🔀' : vehIcon(legs[0].vehicle),
+    from: document.getElementById('rtFrom').value.trim(), to: document.getElementById('rtTo').value.trim(),
+    catId: document.getElementById('rtCat').value || null, roundTrip: document.getElementById('rtRound').checked,
+  };
+  if (id) Object.assign(state.transportRoutes.find(x => x.id === id) || {}, data);
+  else state.transportRoutes.push(Object.assign({ id: uid() }, data));
+  saveState(); closeSheet(); toast(t('savedSuccess')); render();
+}
+function deleteRoute(id) {
+  if (!confirm(isArabic() ? 'تمسح الطريق ده؟ (الرحلات اللي اتسجلت قبل كده هتفضل زي ما هي)' : 'Delete this route? (Logged trips are kept)')) return;
+  state.transportRoutes = state.transportRoutes.filter(x => x.id !== id);
+  saveState(); closeSheet(); render();
+}
+
+/* ---- logging a trip: pay from cash with bills + change (linked to the cash manager) ---- */
+function tripTotal() {
+  const r = state.transportRoutes.find(x => x.id === window.__tripRoute); if (!r) return 0;
+  return routeOneWay(r) * (window.__tripRound ? 2 : 1);
+}
+function openTripSheet(id) {
+  const ar = isArabic();
+  const r = state.transportRoutes.find(x => x.id === id); if (!r) return;
+  window.__tripRoute = id; window.__tripRound = !!r.roundTrip;
+  window.__cashPaid = {}; window.__cashChange = {}; window.__cashChangeManual = false; window.__cashSkip = false;
+  const cashWal = state.wallets.find(w => w.key === 'cash' || w.id === 'wal_cash');
+  openSheet(`
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><h3>🚍 ${escAttr(r.name)}</h3><button class="icon-btn" onclick="closeSheet()">✕</button></div>
+    <div class="small-note" style="margin-bottom:10px;">${routeLegsLine(r)}</div>
+    <div class="filter-chips" style="margin-bottom:12px;">
+      <div class="chip ${window.__tripRound ? '' : 'selected'}" id="tripOne" onclick="tripSetRound(false)">${ar ? 'ذهاب بس' : 'One way'}</div>
+      <div class="chip ${window.__tripRound ? 'selected' : ''}" id="tripRound" onclick="tripSetRound(true)">${ar ? 'ذهاب وعودة' : 'Round trip'}</div>
+    </div>
+    <div class="form-group"><label>${ar ? 'الإجمالي' : 'Total'}</label><input type="number" inputmode="decimal" id="exAmount" value="${tripTotal()}" oninput="cashSectionRefresh()"></div>
+    <div class="form-group"><label>${t('date')}</label><input type="date" id="exDate" value="${todayStr()}"></div>
+    <div class="form-group"><label>${t('wallet')}</label>
+      <select id="exWallet" onchange="cashWalletChanged()">${state.wallets.map(w => `<option value="${w.id}" ${cashWal && w.id === cashWal.id ? 'selected' : ''}>${w.icon} ${walLabel(w)}</option>`).join('')}</select></div>
+    <div id="cashSection"></div>
+    <button class="btn btn-primary" onclick="saveTrip()">${t('save')}</button>
+  `);
+  cashWalletChanged();
+}
+function tripSetRound(b) {
+  window.__tripRound = b;
+  document.getElementById('tripOne').classList.toggle('selected', !b);
+  document.getElementById('tripRound').classList.toggle('selected', b);
+  document.getElementById('exAmount').value = tripTotal();
+  window.__cashPaid = {}; window.__cashChange = {}; window.__cashChangeManual = false;
+  cashSectionRefresh();
+}
+function saveTrip() {
+  const ar = isArabic();
+  const r = state.transportRoutes.find(x => x.id === window.__tripRoute); if (!r) return;
+  const amount = parseFloat(document.getElementById('exAmount').value);
+  if (!(amount > 0)) { toast(ar ? 'اكتب مبلغ صحيح' : 'Enter a valid amount'); return; }
+  const walletId = document.getElementById('exWallet').value;
+  const date = document.getElementById('exDate').value || todayStr();
+  let cashInfo = null;
+  if (isCashWalletId(walletId)) {
+    if (!cashGate(amount, saveTrip)) return;
+    const v = cashValidateAndBuild(amount);
+    if (v.error) { toast(v.error); return; }
+    cashInfo = v;
+  }
+  const envelopeId = transportEnvId();
+  if (!envelopeId) { toast(ar ? 'مفيش قسم مصاريف متاح' : 'No spending category available'); return; }
+  const legs = routeLegs(r).map(l => ({ vehicle: l.vehicle, price: Number(l.price) || 0 }));
+  const tripLegs = window.__tripRound ? legs.concat(legs) : legs;
+  const cashFields = (cashInfo && cashInfo.paid) ? { cashPaid: cashInfo.paid, cashChange: cashInfo.change } : {};
+  if (cashFields.cashPaid) applyCashMovement(cashFields.cashPaid, cashFields.cashChange, +1);
+  state.transactions.push(Object.assign({
+    id: uid(), type: 'expense', amount, envelopeId, date, walletId, createdAt: Date.now(),
+    description: r.name + (window.__tripRound ? (ar ? ' (ذهاب وعودة)' : ' (round trip)') : ''),
+    routeId: r.id, vehicle: tripLegs[0].vehicle, tripLegs, roundTrip: !!window.__tripRound, transportCatId: r.catId || null,
+  }, cashFields));
+  saveState(); closeSheet(); toast(t('savedSuccess')); render();
+}
+
+/* ---- report ---- */
+function renderTransportReport() {
+  const ar = isArabic(), cur = state.settings.currency;
+  const trips = tripsOf();
+  if (!trips.length) return emptyState('📊', ar ? 'لسه مفيش رحلات متسجلة' : 'No trips logged yet', t('routesSub'));
+  const monthKey = todayStr().slice(0, 7);
+  const byRoute = {}, byVeh = {}, byCat = {};
+  trips.forEach(x => {
+    byRoute[x.routeId] = byRoute[x.routeId] || { n: 0, sum: 0 }; byRoute[x.routeId].n++; byRoute[x.routeId].sum += x.amount;
+    const cid = catOf(x.transportCatId) ? x.transportCatId : 'none';
+    byCat[cid] = byCat[cid] || { n: 0, sum: 0 }; byCat[cid].n++; byCat[cid].sum += x.amount;
+    const legs = Array.isArray(x.tripLegs) && x.tripLegs.length ? x.tripLegs : [{ vehicle: x.vehicle || 'bus', price: x.amount }];
+    legs.forEach(l => { byVeh[l.vehicle] = byVeh[l.vehicle] || { n: 0, sum: 0 }; byVeh[l.vehicle].n++; byVeh[l.vehicle].sum += Number(l.price) || 0; });
+  });
+  const topRouteId = Object.keys(byRoute).sort((a, b) => byRoute[b].n - byRoute[a].n)[0];
+  const topRoute = state.transportRoutes.find(r => r.id === topRouteId);
+  const topVeh = Object.keys(byVeh).sort((a, b) => byVeh[b].n - byVeh[a].n)[0];
+  const total = trips.reduce((a, x) => a + x.amount, 0);
+  const recent = trips.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 8);
+  return `
+    <div class="month-row">
+      <div class="month-card"><div class="v">${trips.length}</div><div class="l">${t('totalTrips')}</div></div>
+      <div class="month-card"><div class="v">${trips.filter(x => String(x.date).slice(0, 7) === monthKey).length}</div><div class="l">${t('tripsThisMonth')}</div></div>
+    </div>
+    <div class="card">
+      <div class="list-row"><div class="mid t1">${t('totalTransportSpent')}</div><div class="amt neg">${fmt(total)} ${cur}</div></div>
+      <div class="list-row"><div class="mid t1">${t('mostUsedRoute')}</div><div class="amt neu">${topRoute ? escAttr(topRoute.name) : '—'}</div></div>
+      <div class="list-row"><div class="mid t1">${t('mostUsedVehicle')}</div><div class="amt neu">${vehIcon(topVeh)} ${t(topVeh)}</div></div>
+    </div>
+    <div class="section-head"><h2>🗂 ${ar ? 'حسب القسم' : 'By category'}</h2></div>
+    <div class="card">${Object.keys(byCat).sort((a, b) => byCat[b].sum - byCat[a].sum).map(cid => { const c = catOf(cid); return `
+      <div class="list-row"><div class="ico-badge">${c ? c.icon : '📂'}</div><div class="mid"><div class="t1">${c ? escAttr(c.name) : (ar ? 'بدون قسم' : 'No category')}</div><div class="t2">${byCat[cid].n} ${ar ? 'رحلة' : 'trips'}</div></div><div class="amt neg">${fmt(byCat[cid].sum)} ${cur}</div></div>`; }).join('')}</div>
+    <div class="section-head"><h2>${t('vehicleStats')}</h2></div>
+    <div class="card">${Object.keys(byVeh).sort((a, b) => byVeh[b].n - byVeh[a].n).map(v => `
+      <div class="list-row"><div class="ico-badge">${vehIcon(v)}</div><div class="mid"><div class="t1">${t(v)}</div><div class="t2">${byVeh[v].n} ${ar ? 'ركوبة' : 'rides'}</div></div><div class="amt neg">${fmt(byVeh[v].sum)} ${cur}</div></div>`).join('')}</div>
+    <div class="section-head"><h2>${ar ? 'آخر الرحلات' : 'Recent trips'}</h2></div>
+    <div class="card">${recent.map(x => `
+      <div class="list-row"><div class="mid"><div class="t1">${escAttr(x.description || '')}</div><div class="t2">${x.date}${x.cashPaid ? ` · 💵 ${denSummary(x.cashPaid)}` : ''}${x.cashChange && Object.keys(x.cashChange).length ? ` · ↩️ ${denSummary(x.cashChange)}` : ''}</div></div><div class="amt neg">${fmt(x.amount)} ${cur}</div></div>`).join('')}</div>
+  `;
 }

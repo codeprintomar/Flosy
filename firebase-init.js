@@ -15,6 +15,8 @@ import {
   GoogleAuthProvider,
   signInWithPopup,
   signInWithRedirect,
+  linkWithPopup,
+  linkWithRedirect,
   getRedirectResult,
   sendPasswordResetEmail,
 } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-auth.js";
@@ -102,6 +104,34 @@ window.FB = {
   async getGoogleRedirectResult() {
     const cred = await getRedirectResult(auth);
     return cred ? cred.user : null;
+  },
+
+  /** Provider ids linked to the current user, e.g. ["password", "google.com"]. */
+  getProviderIds() {
+    const u = auth.currentUser;
+    return u ? u.providerData.map((p) => p.providerId) : [];
+  },
+
+  /**
+   * Link a Google account to the CURRENTLY signed-in account (same uid, same
+   * Firestore data) so the user can later sign in with either method.
+   */
+  async linkGoogle() {
+    const u = auth.currentUser;
+    if (!u) throw Object.assign(new Error("not signed in"), { code: "auth/requires-recent-login" });
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: "select_account" });
+    try {
+      await linkWithPopup(u, provider);
+    } catch (e) {
+      if (e.code === "auth/popup-blocked" || e.code === "auth/operation-not-supported-in-this-environment") {
+        await linkWithRedirect(u, provider);
+        return null;
+      }
+      throw e;
+    }
+    await u.reload();
+    return auth.currentUser;
   },
 
   /** Send a password-reset email for the given address. */
